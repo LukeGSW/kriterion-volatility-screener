@@ -1,503 +1,301 @@
 """
-debug_pipeline.py — Script di diagnostica per il Kriterion Quant Screener.
+debug_pipeline.py - Diagnostica per il Kriterion Quant Volatility Screener.
 
 Esegui con:
     EODHD_API_KEY=xxx python src/debug_pipeline.py
 
-Testa ogni stadio del pipeline in isolamento e identifica il collo di bottiglia.
-Output: report testuale dettagliato su console.
+Testa ogni stadio in isolamento e identifica il collo di bottiglia.
 """
 
-import json
 import os
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import requests
 
-# Aggiungi src/ al path
 sys.path.insert(0, str(Path(__file__).parent))
 
 try:
     from quant_engine import (
-        MIN_ADV,
-        PERCENTILE_LOOKBACK,
-        RV_WINDOW,
-        compute_adv,
-        compute_log_returns,
-        compute_realized_volatility,
-        compute_rv_percentile,
+        MIN_ADV, PERCENTILE_LOOKBACK, RV_WINDOW,
+        compute_adv, compute_log_returns,
+        compute_realized_volatility, compute_rv_percentile,
     )
-    QUANT_ENGINE_OK = True
+    QUANT_OK = True
 except ImportError as e:
-    QUANT_ENGINE_OK = False
-    QUANT_ENGINE_ERR = str(e)
+    QUANT_OK  = False
+    QUANT_ERR = str(e)
 
 BASE_URL = "https://eodhd.com/api"
 SEP      = "=" * 68
-SEP_THIN = "-" * 68
 
-
-def section(title: str) -> None:
-    print(f"\n{SEP}")
-    print(f"  {title}")
+def section(t):
+    print("\n" + SEP)
+    print("  " + t)
     print(SEP)
 
-
-def ok(msg: str)   -> None: print(f"  ✓  {msg}")
-def fail(msg: str) -> None: print(f"  ✗  {msg}")
-def info(msg: str) -> None: print(f"  →  {msg}")
-def warn(msg: str) -> None: print(f"  ⚠  {msg}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 1 — Screener grezzo senza filtri (verifica struttura risposta)
-# ─────────────────────────────────────────────────────────────────────────────
-def test_screener_raw(api_key: str) -> dict | None:
-    section("TEST 1 — Screener API: risposta grezza senza filtri (limit=5)")
-
-    url = f"{BASE_URL}/screener"
-    params = {"api_token": api_key, "limit": 5, "fmt": "json"}
-
-    try:
-        r = requests.get(url, params=params, timeout=30)
-        print(f"  HTTP status: {r.status_code}")
-
-        if r.status_code != 200:
-            fail(f"Errore HTTP {r.status_code}: {r.text[:200]}")
-            return None
-
-        data = r.json()
-    except Exception as e:
-        fail(f"Eccezione: {e}")
-        return None
-
-    print(f"  Tipo risposta: {type(data).__name__}")
-
-    if isinstance(data, dict):
-        keys = list(data.keys())
-        info(f"Chiavi dict: {keys}")
-        total = data.get("total", "ASSENTE")
-        info(f"Campo 'total': {total}")
-        records = data.get("data", data.get("results", []))
-        info(f"Records nella pagina: {len(records)}")
-
-        if records:
-            first = records[0]
-            info(f"Campi del primo record: {list(first.keys())}")
-            print(f"\n  --- Primo record completo ---")
-            for k, v in first.items():
-                print(f"      {k:35s}: {v}")
-            print()
-
-            # Controlla valore di market_capitalization per i primi 3
-            print(f"  market_capitalization nei primi record:")
-            for rec in records[:5]:
-                mc  = rec.get("market_capitalization", rec.get("market_cap", "N/A"))
-                exc = rec.get("exchange", "?")
-                typ = rec.get("type", "?")
-                print(f"      {rec.get('code','?'):10s} | {exc:8s} | {typ:15s} | market_cap={mc}")
-
-        return data
-
-    elif isinstance(data, list):
-        warn("La risposta è una LISTA (non un dict) — struttura diversa dall'atteso!")
-        info(f"Lunghezza lista: {len(data)}")
-        if data:
-            info(f"Campi primo elemento: {list(data[0].keys()) if isinstance(data[0], dict) else type(data[0])}")
-            print(f"  Primo elemento: {json.dumps(data[0], default=str)[:300]}")
-        return {"data": data, "total": len(data)}
-
-    else:
-        fail(f"Risposta di tipo inatteso: {type(data)} — {str(data)[:300]}")
-        return None
+def ok(m):   print("  OK  " + m)
+def fail(m): print("  KO  " + m)
+def info(m): print("  ->  " + m)
+def warn(m): print("  !!  " + m)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 2 — Indagine unità market_capitalization nel filtro screener
-# ─────────────────────────────────────────────────────────────────────────────
-def test_screener_cap_units(api_key: str) -> int | None:
-    """
-    Prova tre soglie diverse per capire in quali unità EODHD interpreta
-    il campo market_capitalization nel parametro filters.
-
-    Scenario atteso:
-      Se unità = USD      → soglia 2_000_000_000  restituisce ~600-800 ticker US
-      Se unità = migliaia → soglia 2_000_000      restituisce ~600-800 ticker US
-      Se unità = milioni  → soglia 2_000          restituisce ~600-800 ticker US
-
-    Restituisce la soglia corretta da usare nel codice.
-    """
-    section("TEST 2 — Unità market_cap nel filtro screener (auto-detection)")
-
-    candidates = [
-        (2_000_000_000, "USD puri       (2,000,000,000)"),
-        (2_000_000,     "Migliaia USD   (2,000,000)    "),
-        (2_000,         "Milioni USD    (2,000)        "),
-    ]
-
-    correct_threshold = None
-    url = f"{BASE_URL}/screener"
-
-    for threshold, label in candidates:
-        filters = json.dumps([["market_capitalization", ">=", threshold]])
-        params  = {"api_token": api_key, "filters": filters, "limit": 1, "fmt": "json"}
-        try:
-            r    = requests.get(url, params=params, timeout=30)
-            data = r.json()
-            total = int(data.get("total", 0)) if isinstance(data, dict) else len(data)
-            status = "✓ PLAUSIBILE" if 300 <= total <= 3000 else ("⚠ TROPPO BASSO" if total < 300 else "⚠ TROPPO ALTO")
-            print(f"  threshold={label} → total={total:6d}  {status}")
-            if 300 <= total <= 3000 and correct_threshold is None:
-                correct_threshold = threshold
-        except Exception as e:
-            print(f"  threshold={label} → ERRORE: {e}")
-        time.sleep(0.4)
-
-    if correct_threshold:
-        ok(f"Soglia corretta rilevata: {correct_threshold:,}")
-        info(f"Usa questo valore in data_fetcher.py e pipeline.py")
-    else:
-        warn("Nessuna soglia produce un risultato plausibile (300-3000 ticker US).")
-        info("Potrebbe esserci un problema con il piano API o con i parametri del filtro.")
-
-    return correct_threshold
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 3 — Screener con filtri attivi (struttura e numero risultati)
-# ─────────────────────────────────────────────────────────────────────────────
-def test_screener_filtered(api_key: str, threshold: int | None) -> int:
-    section("TEST 3 — Screener con filtro market_cap attivo")
-
-    if threshold is None:
-        threshold = 2_000_000_000
-        warn(f"Soglia non rilevata automaticamente, uso default {threshold:,}")
-
-    url     = f"{BASE_URL}/screener"
-    filters = json.dumps([["market_capitalization", ">=", threshold]])
-    params  = {
-        "api_token": api_key,
-        "filters":   filters,
-        "limit":     10,
-        "fmt":       "json",
-    }
-
-    try:
-        r    = requests.get(url, params=params, timeout=30)
-        data = r.json()
-    except Exception as e:
-        fail(f"Eccezione: {e}")
-        return 0
-
-    total   = int(data.get("total", 0)) if isinstance(data, dict) else 0
-    records = data.get("data", []) if isinstance(data, dict) else data[:10]
-
-    info(f"Total (API): {total}")
-    info(f"Records nella prima pagina: {len(records)}")
-
-    exchange_counts: dict = {}
-    type_counts: dict     = {}
-    for rec in records:
-        exc = rec.get("exchange", "?")
-        typ = rec.get("type", "?")
-        exchange_counts[exc] = exchange_counts.get(exc, 0) + 1
-        type_counts[typ]     = type_counts.get(typ,     0) + 1
-        mc  = rec.get("market_capitalization", rec.get("market_cap", "N/A"))
-        print(f"    {rec.get('code','?'):10s} | {exc:8s} | {typ:15s} | mc={mc}")
-
-    if total > 0:
-        ok(f"Screener funziona: {total} ticker totali trovati con filtro >= {threshold:,}")
-    else:
-        fail("Screener restituisce 0 risultati con questo filtro.")
-
-    return total
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 4 — Exchange Symbol List (alternativa al Screener)
-# ─────────────────────────────────────────────────────────────────────────────
-def test_exchange_list(api_key: str) -> list:
-    section("TEST 4 — Exchange Symbol List /api/exchange-symbol-list/US")
-
-    url    = f"{BASE_URL}/exchange-symbol-list/US"
+# -- TEST 1: Exchange Symbol List ---------------------------------------------
+def test_exchange_list(api_key):
+    section("TEST 1 - Exchange Symbol List /api/exchange-symbol-list/US")
+    url    = "{}/exchange-symbol-list/US".format(BASE_URL)
     params = {"api_token": api_key, "fmt": "json"}
-
     try:
         r    = requests.get(url, params=params, timeout=60)
         data = r.json()
     except Exception as e:
-        fail(f"Eccezione: {e}")
+        fail("Eccezione: {}".format(e))
         return []
 
-    if isinstance(data, list):
-        ok(f"Lista exchange US: {len(data)} ticker totali")
-        if data:
-            info(f"Campi disponibili: {list(data[0].keys())}")
-            for item in data[:3]:
-                print(f"    {json.dumps(item)}")
-        return data
+    print("  HTTP status: {}".format(r.status_code))
+    if not isinstance(data, list):
+        fail("Risposta non e' una lista: {}".format(type(data)))
+        return []
+
+    ok("Ticker totali: {:,}".format(len(data)))
+    if data:
+        info("Campi: {}".format(list(data[0].keys())))
+        # Distribuzione exchange
+        exchanges = {}
+        types     = {}
+        for item in data:
+            exc = item.get("Exchange", item.get("exchange", "?"))
+            typ = item.get("Type",     item.get("type",     "?"))
+            exchanges[exc] = exchanges.get(exc, 0) + 1
+            types[typ]     = types.get(typ,     0) + 1
+        top_exc = sorted(exchanges.items(), key=lambda x: -x[1])[:8]
+        print("  Top exchange:")
+        for exc, cnt in top_exc:
+            print("      {:20s}: {:>6,}".format(exc, cnt))
+        print("  Tipi strumento:")
+        for typ, cnt in sorted(types.items(), key=lambda x: -x[1])[:5]:
+            print("      {:20s}: {:>6,}".format(typ, cnt))
+
+    primary = {"NYSE","NASDAQ","NYSE ARCA","BATS","NYSE MKT","AMEX","NYSE American","CBOE"}
+    valid_t = {"Common Stock","ETF"}
+    filtered = [
+        x for x in data
+        if x.get("Exchange", x.get("exchange","")) in primary
+        and x.get("Type", x.get("type","")) in valid_t
+    ]
+    ok("Dopo filtro exchange primari + tipo: {:,} ticker".format(len(filtered)))
+    return filtered
+
+
+# -- TEST 2: Bulk Last-Day EOD ------------------------------------------------
+def test_bulk_last_day(api_key):
+    section("TEST 2 - Bulk Last-Day /api/eod-bulk-last-day/US")
+    url    = "{}/eod-bulk-last-day/US".format(BASE_URL)
+    params = {"api_token": api_key, "fmt": "json"}
+    try:
+        r    = requests.get(url, params=params, timeout=120)
+        data = r.json()
+    except Exception as e:
+        fail("Eccezione: {}".format(e))
+        return pd.DataFrame()
+
+    print("  HTTP status: {}".format(r.status_code))
+    if not isinstance(data, list):
+        warn("Risposta non e' una lista: {}".format(type(data)))
+        return pd.DataFrame()
+
+    ok("Record ricevuti: {:,}".format(len(data)))
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+    info("Colonne: {}".format(list(df.columns)))
+    info("Esempio primo record: {}".format(data[0]))
+
+    # Rinomina standard
+    df.columns = [c.strip() for c in df.columns]
+    col_map = {
+        "code":"ticker","Code":"ticker",
+        "volume":"last_volume","Volume":"last_volume",
+        "close":"last_close","Close":"last_close",
+        "market_capitalization":"market_cap","MarketCapitalization":"market_cap",
+    }
+    df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
+
+    for col in ["last_volume","last_close","market_cap"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "last_volume" in df.columns:
+        above_100k = (df["last_volume"] >= 100_000).sum()
+        above_500k = (df["last_volume"] >= 500_000).sum()
+        above_1m   = (df["last_volume"] >= 1_500_000).sum()
+        ok("Volume >= 100K shares: {:,} ticker".format(above_100k))
+        info("Volume >= 500K shares: {:,} ticker".format(above_500k))
+        info("Volume >= 1.5M shares: {:,} ticker".format(above_1m))
     else:
-        warn(f"Risposta inattesa: {type(data)} — {str(data)[:300]}")
-        return []
+        warn("Campo 'last_volume' non presente nel response!")
+
+    if "market_cap" in df.columns:
+        n_cap = df["market_cap"].notna().sum()
+        info("market_cap disponibile per {:,} ticker".format(n_cap))
+        if n_cap > 0:
+            above_2b = (df["market_cap"] >= 2_000_000_000).sum()
+            info("market_cap >= $2B: {:,} ticker".format(above_2b))
+    else:
+        info("market_cap NON presente nel response bulk last-day")
+
+    return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 5 — OHLCV per un ticker noto (AAPL)
-# ─────────────────────────────────────────────────────────────────────────────
-def test_ohlcv(api_key: str, ticker: str = "AAPL") -> list:
-    section(f"TEST 5 — OHLCV per {ticker} (4 anni di storia)")
+# -- TEST 3: Combinato (exchange-list x bulk-last-day) ------------------------
+def test_combined_universe(sym_list, bulk_df):
+    section("TEST 3 - Universo combinato (exchange-list + bulk last-day pre-filtro)")
 
+    if not sym_list:
+        warn("Exchange-list vuota - salta.")
+        return
+
+    sym_df = pd.DataFrame(sym_list)
+    col_map = {
+        "Code":"ticker","code":"ticker",
+        "Exchange":"exchange","exchange":"exchange",
+        "Type":"type","type":"type",
+    }
+    sym_df = sym_df.rename(columns={k:v for k,v in col_map.items() if k in sym_df.columns})
+    info("Ticker da exchange-list (primari+tipo): {:,}".format(len(sym_df)))
+
+    if bulk_df.empty or "last_volume" not in bulk_df.columns:
+        warn("Bulk data non disponibile - pre-filtro volume saltato.")
+        return
+
+    merged = sym_df.merge(bulk_df[["ticker","last_volume"]], on="ticker", how="left")
+    info("Dopo join con bulk data: {:,} ticker".format(len(merged)))
+
+    after_vol = merged[merged["last_volume"].fillna(0) >= 100_000]
+    ok("Dopo pre-filtro volume >= 100K: {:,} ticker".format(len(after_vol)))
+    info("Questi ticker verranno scaricati per 3 anni di OHLCV")
+    info("Tempo stimato download OHLCV (5 workers, 0.1s delay): ~{:.0f} minuti".format(
+        len(after_vol) * 0.1 / 5 / 60
+    ))
+
+
+# -- TEST 4: OHLCV singolo ticker (AAPL) --------------------------------------
+def test_ohlcv(api_key, ticker="AAPL"):
+    section("TEST 4 - OHLCV per {} (4 anni)".format(ticker))
     today     = datetime.utcnow().date()
     from_date = (today - timedelta(days=4 * 365)).isoformat()
 
-    url    = f"{BASE_URL}/eod/{ticker}.US"
+    url    = "{}/eod/{}.US".format(BASE_URL, ticker)
     params = {
-        "api_token":     api_key,
-        "from":          from_date,
-        "to":            today.isoformat(),
-        "adjusted_close":"true",
-        "fmt":           "json",
+        "api_token": api_key, "fmt": "json",
+        "from": from_date, "to": today.isoformat(),
+        "adjusted_close": "true",
     }
-
     try:
-        r = requests.get(url, params=params, timeout=30)
-        print(f"  HTTP status: {r.status_code}")
+        r    = requests.get(url, params=params, timeout=30)
         data = r.json()
     except Exception as e:
-        fail(f"Eccezione: {e}")
+        fail("Eccezione: {}".format(e))
         return []
 
-    if isinstance(data, list) and data:
-        ok(f"Righe ricevute: {len(data)}")
-        info(f"Colonne: {list(data[0].keys())}")
-        info(f"Prima riga: {data[0]}")
-        info(f"Ultima riga: {data[-1]}")
+    print("  HTTP status: {}".format(r.status_code))
+    if not isinstance(data, list) or not data:
+        fail("Risposta inattesa: {}".format(type(data)))
+        return []
 
-        # Verifica campo adjusted_close
-        has_adj = "adjusted_close" in data[0]
-        if has_adj:
-            ok("Campo 'adjusted_close' presente")
-        else:
-            warn("Campo 'adjusted_close' ASSENTE — presente solo 'close'")
-            info(f"Campi disponibili: {list(data[0].keys())}")
+    ok("Righe ricevute: {:,}".format(len(data)))
+    info("Colonne: {}".format(list(data[0].keys())))
+    info("Prima riga: {}".format(data[0]))
+    info("Ultima riga: {}".format(data[-1]))
 
-        return data
+    has_adj = "adjusted_close" in data[0]
+    if has_adj:
+        ok("Campo 'adjusted_close' presente")
     else:
-        fail(f"Risposta inattesa o vuota: {type(data)} — {str(data)[:300]}")
-        return []
+        warn("Campo 'adjusted_close' ASSENTE - solo 'close' disponibile")
+
+    return data
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 6 — Motore quantitativo su AAPL (simula l'analisi reale)
-# ─────────────────────────────────────────────────────────────────────────────
-def test_quant_engine(ohlcv_data: list, ticker: str = "AAPL") -> None:
-    section(f"TEST 6 — Motore quantitativo su {ticker}")
+# -- TEST 5: Motore quantitativo su AAPL --------------------------------------
+def test_quant_engine(ohlcv_data, ticker="AAPL"):
+    section("TEST 5 - Motore quantitativo su {}".format(ticker))
 
-    if not QUANT_ENGINE_OK:
-        fail(f"quant_engine.py non importabile: {QUANT_ENGINE_ERR}")
+    if not QUANT_OK:
+        fail("quant_engine non importabile: {}".format(QUANT_ERR))
         return
-
     if not ohlcv_data:
-        warn("Nessun dato OHLCV da analizzare — salta.")
+        warn("Nessun dato OHLCV - salta.")
         return
 
-    # Build DataFrame
     df = pd.DataFrame(ohlcv_data)
     df.columns = [c.lower() for c in df.columns]
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.sort_values("date").reset_index(drop=True)
 
-    # adjusted_close o fallback a close
-    if "adjusted_close" in df.columns:
-        df["adjusted_close"] = pd.to_numeric(df["adjusted_close"], errors="coerce")
-    elif "close" in df.columns:
-        warn("adjusted_close assente, uso 'close' come fallback")
-        df["adjusted_close"] = pd.to_numeric(df["close"], errors="coerce")
-    else:
-        fail("Nessuna colonna di prezzo trovata.")
-        return
-
-    df["volume"] = pd.to_numeric(df.get("volume", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    ac = "adjusted_close" if "adjusted_close" in df.columns else "close"
+    df["adjusted_close"] = pd.to_numeric(df[ac], errors="coerce")
+    df["volume"]         = pd.to_numeric(df.get("volume", pd.Series(dtype=float)), errors="coerce").fillna(0)
     df = df.dropna(subset=["adjusted_close"])
 
-    n_rows = len(df)
-    min_req = PERCENTILE_LOOKBACK + RV_WINDOW  # 756 + 90 = 846
-    info(f"Righe dopo pulizia: {n_rows}")
-    info(f"Periodo: {df['date'].min().date()} → {df['date'].max().date()}")
+    n   = len(df)
+    req = PERCENTILE_LOOKBACK + RV_WINDOW
+    info("Righe dopo pulizia: {:,}".format(n))
+    info("Periodo: {} -> {}".format(df["date"].min().date(), df["date"].max().date()))
+
     print()
+    print("  {:35s}: req={} have={}  {}".format(
+        "Storia minima", req, n, "OK" if n >= req else "KO - MANCANO {} gg".format(req - n)
+    ))
 
-    # ── Storia minima ──────────────────────────────────────────────────────
-    print(f"  {'STORIA MINIMA':35s}: richiesti={min_req} gg, disponibili={n_rows} gg", end="  ")
-    if n_rows >= min_req:
-        ok("OK")
-    else:
-        fail(f"MANCANO {min_req - n_rows} giorni lavorativi")
-        info("Fix: aumenta HISTORY_BUFFER_DAYS in pipeline.py (da 90 a 365+)")
+    adv30 = compute_adv(df["volume"], 30).iloc[-1]
+    adv90 = compute_adv(df["volume"], 90).iloc[-1]
+    print("  {:35s}: {:>15,.0f}  {}".format("ADV 30d", adv30, "OK" if adv30 >= MIN_ADV else "KO"))
+    print("  {:35s}: {:>15,.0f}  {}".format("ADV 90d", adv90, "OK" if adv90 >= MIN_ADV else "KO"))
 
-    # ── ADV ────────────────────────────────────────────────────────────────
-    adv_30 = compute_adv(df["volume"], 30).iloc[-1]
-    adv_90 = compute_adv(df["volume"], 90).iloc[-1]
-    print(f"  {'ADV 30d':35s}: {adv_30:>12,.0f}  ", end="")
-    ok("OK") if adv_30 >= MIN_ADV else fail(f"sotto soglia {MIN_ADV:,.0f}")
-    print(f"  {'ADV 90d':35s}: {adv_90:>12,.0f}  ", end="")
-    ok("OK") if adv_90 >= MIN_ADV else fail(f"sotto soglia {MIN_ADV:,.0f}")
-
-    # ── RV rolling ────────────────────────────────────────────────────────
     log_ret  = compute_log_returns(df["adjusted_close"])
-    rv_series = compute_realized_volatility(log_ret, window=RV_WINDOW)
-    rv_valid  = rv_series.notna().sum()
-    rv_now    = rv_series.iloc[-1]
-    print(f"  {'RV valori non-NaN':35s}: {rv_valid}  ", end="")
-    ok("OK") if rv_valid > 0 else fail("nessun valore RV calcolato")
+    rv_s     = compute_realized_volatility(log_ret, window=RV_WINDOW)
+    rv_valid = rv_s.notna().sum()
+    rv_now   = rv_s.iloc[-1]
+    print("  {:35s}: {}  {}".format("Valori RV non-NaN", rv_valid, "OK" if rv_valid > 0 else "KO"))
+
+    pct_s     = compute_rv_percentile(rv_s, lookback=PERCENTILE_LOOKBACK)
+    pct_valid = pct_s.notna().sum()
+    pct_now   = pct_s.iloc[-1]
+    print("  {:35s}: {}  {}".format("Percentile non-NaN", pct_valid, "OK" if pct_valid > 0 else "KO"))
+
     if pd.notna(rv_now):
-        info(f"RV corrente ({RV_WINDOW}d): {rv_now * 100:.2f}%")
-
-    # ── Percentile rolling ────────────────────────────────────────────────
-    pct_series = compute_rv_percentile(rv_series, lookback=PERCENTILE_LOOKBACK)
-    pct_valid  = pct_series.notna().sum()
-    pct_now    = pct_series.iloc[-1]
-    print(f"  {'Percentile valori non-NaN':35s}: {pct_valid}  ", end="")
-    ok("OK") if pct_valid > 0 else fail("nessun percentile calcolato")
-
+        info("RV corrente ({}d): {:.2f}%".format(RV_WINDOW, rv_now * 100))
     if pd.notna(pct_now):
-        label = "⚡ COMPRESSO!" if pct_now <= 5 else ("vicino" if pct_now <= 15 else "nella norma")
-        info(f"RV Percentile attuale: {pct_now:.2f}° — {label}")
+        tag = "COMPRESSO!" if pct_now <= 5 else ("attenzione" if pct_now <= 15 else "normale")
+        info("RV Percentile: {:.1f} - {}".format(pct_now, tag))
     else:
-        warn("RV Percentile è NaN sull'ultimo giorno")
-        needed = PERCENTILE_LOOKBACK + RV_WINDOW + 1
-        info(f"Per percentile valido servono {needed} gg lavorativi di storia ({needed - n_rows:+d} rispetto al disponibile)")
-
-    # ── Distribuzione RV ──────────────────────────────────────────────────
-    if pct_valid > 0:
-        print()
-        print(f"  Distribuzione percentile RV (su {pct_valid} valori calcolati):")
-        for q in [0, 5, 10, 25, 50, 75, 90, 95, 100]:
-            v = np.nanpercentile(pct_series.dropna(), q)
-            print(f"      p{q:3d}: {v:.1f}")
+        warn("RV Percentile NaN - storia insufficiente (need {} RV validi, have {})".format(
+            PERCENTILE_LOOKBACK, rv_valid
+        ))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 7 — Simulazione pipeline completo su 3 ticker noti
-# ─────────────────────────────────────────────────────────────────────────────
-def test_pipeline_sample(api_key: str) -> None:
-    section("TEST 7 — Pipeline completo su 3 ticker campione (AAPL, MSFT, NVDA)")
-
-    tickers   = ["AAPL", "MSFT", "NVDA"]
-    today     = datetime.utcnow().date()
-    from_date = (today - timedelta(days=4 * 365)).isoformat()
-
-    for ticker in tickers:
-        print(f"\n  {SEP_THIN}")
-        print(f"  {ticker}")
-        print(f"  {SEP_THIN}")
-        url    = f"{BASE_URL}/eod/{ticker}.US"
-        params = {
-            "api_token":      api_key,
-            "from":           from_date,
-            "to":             today.isoformat(),
-            "adjusted_close": "true",
-            "fmt":            "json",
-        }
-        try:
-            r    = requests.get(url, params=params, timeout=30)
-            data = r.json()
-        except Exception as e:
-            fail(f"OHLCV fetch fallito: {e}")
-            continue
-
-        if not isinstance(data, list) or not data:
-            fail(f"Risposta vuota o non lista: {type(data)}")
-            continue
-
-        test_quant_engine(data, ticker)
-        time.sleep(0.3)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 8 — Fundamentals endpoint (market cap per AAPL)
-# ─────────────────────────────────────────────────────────────────────────────
-def test_fundamentals_marketcap(api_key: str) -> None:
-    section("TEST 8 — Fundamentals endpoint: market_cap di AAPL (verifica unità)")
-
-    url    = f"{BASE_URL}/fundamentals/AAPL.US"
-    params = {"api_token": api_key, "filter": "General", "fmt": "json"}
-
-    try:
-        r    = requests.get(url, params=params, timeout=30)
-        data = r.json()
-    except Exception as e:
-        fail(f"Eccezione: {e}")
-        return
-
-    if not isinstance(data, dict):
-        warn(f"Risposta inattesa: {type(data)}")
-        return
-
-    general = data.get("General", data)
-    mc_raw  = general.get("MarketCapitalization", general.get("market_capitalization", "N/A"))
-    info(f"MarketCapitalization AAPL (raw): {mc_raw}")
-
-    if mc_raw != "N/A":
-        try:
-            mc_float = float(mc_raw)
-            if mc_float > 1e12:
-                ok(f"Unità = USD puri (AAPL = ${mc_float/1e12:.2f}T)")
-                info("→ usa threshold=2_000_000_000 nel filtro screener")
-            elif mc_float > 1e9:
-                ok(f"Unità = migliaia USD (AAPL = ${mc_float/1e9:.2f}B in migliaia)")
-                info("→ usa threshold=2_000_000 nel filtro screener")
-            elif mc_float > 1e6:
-                ok(f"Unità = milioni USD (AAPL = ${mc_float/1e6:.2f}T in milioni)")
-                info("→ usa threshold=2_000 nel filtro screener")
-            else:
-                warn(f"Valore inatteso: {mc_float}")
-        except (TypeError, ValueError):
-            warn(f"Non numerico: {mc_raw}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# -- MAIN ---------------------------------------------------------------------
 if __name__ == "__main__":
     api_key = os.environ.get("EODHD_API_KEY", "").strip()
     if not api_key:
-        print("ERRORE: variabile d'ambiente EODHD_API_KEY non impostata.")
-        print("  Esegui: EODHD_API_KEY=<tuo_token> python src/debug_pipeline.py")
+        print("ERRORE: EODHD_API_KEY non impostata.")
+        print("  Esegui: EODHD_API_KEY=<token> python src/debug_pipeline.py")
         sys.exit(1)
 
-    print(f"\n{'⚡ KRITERION QUANT — DIAGNOSTICA PIPELINE':^68}")
-    print(f"{'Run: ' + datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC'):^68}")
+    print("\n{:^68}".format("KRITERION QUANT - DIAGNOSTICA PIPELINE"))
+    print("{:^68}".format(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")))
 
-    # Stadio 1: struttura risposta screener
-    test_screener_raw(api_key)
-
-    # Stadio 2: rileva unità market_cap
-    correct_threshold = test_screener_cap_units(api_key)
-
-    # Stadio 3: screener con filtro
-    test_screener_filtered(api_key, correct_threshold)
-
-    # Stadio 4: exchange list (alternativa)
-    test_exchange_list(api_key)
-
-    # Stadio 5: OHLCV per AAPL
-    ohlcv = test_ohlcv(api_key, "AAPL")
-
-    # Stadio 6: motore quantitativo su AAPL
+    sym_list = test_exchange_list(api_key)
+    bulk_df  = test_bulk_last_day(api_key)
+    test_combined_universe(sym_list, bulk_df)
+    ohlcv    = test_ohlcv(api_key, "AAPL")
     test_quant_engine(ohlcv, "AAPL")
 
-    # Stadio 7: pipeline completo su 3 ticker
-    test_pipeline_sample(api_key)
-
-    # Stadio 8: fundamentals per verifica unità
-    test_fundamentals_marketcap(api_key)
-
-    print(f"\n{SEP}")
+    print("\n" + SEP)
     print("  Diagnostica completata.")
-    print("  Incolla l'output completo per analisi approfondita.")
     print(SEP + "\n")
