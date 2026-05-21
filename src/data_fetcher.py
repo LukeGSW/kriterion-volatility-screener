@@ -159,7 +159,7 @@ class EODHDClient:
         """
         url    = "{}/eod-bulk-last-day/US".format(BASE_URL)
         params = self._p()
-
+        params["filter"] = "extended"  # <--- AGGIUNGI QUESTA RIGA
         try:
             data = _get_json(url, params)
         except EODHDError as e:
