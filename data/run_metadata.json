@@ -1,12 +1,16 @@
 {
-  "run_timestamp": "2026-05-21T06:13:21.145496",
-  "tickers_scanned": 5,
-  "tickers_with_data": 5,
-  "tickers_passed_filters": 0,
-  "tickers_compressed": 0,
+  "run_timestamp": "2026-05-21T06:47:49.404103",
+  "tickers_scanned": 5633,
+  "tickers_with_data": 5633,
+  "tickers_passed_filters": 1634,
+  "tickers_compressed": 30,
   "rv_window": 90,
   "percentile_lookback": 756,
   "compression_threshold": 5.0,
   "min_market_cap": 2000000000,
-  "min_adv": 1500000
+  "min_adv": 1500000,
+  "history_years": 3,
+  "history_buffer_days": 365,
+  "from_date": "2022-05-22",
+  "to_date": "2026-05-21"
 }
