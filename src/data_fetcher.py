@@ -1,430 +1,308 @@
 """
-data_fetcher.py — EODHD API client for the Kriterion Quant Volatility Screener.
+data_fetcher.py - EODHD API client for the Kriterion Quant Volatility Screener.
 
-Handles:
-  - Universe retrieval via EODHD Screener (primary) con auto-detection unità
-    market_capitalization e filtro country-based + fallback exchange-symbol-list.
-  - Bulk OHLCV historical data (parallel, with retry/backoff).
-  - Upcoming earnings calendar for a list of tickers.
+Strategia universo:
+  1. /api/exchange-symbol-list/US  -> tutti i ticker US, filtro exchange primari + tipo.
+  2. /api/eod-bulk-last-day/US     -> una sola chiamata, volume ultimo giorno.
+     Pre-filtro: scarta ticker con volume < 100K shares.
+     Se disponibile nel response, usa market_cap per pre-filtro >= 2B.
+  3. L'ADV rolling (30d/90d >= 1.5M) e' il filtro definitivo in quant_engine.
 
-No options data is fetched. Liquidità delle option chain è responsabilità
-del trader in fase di esecuzione.
+Questo riduce l'universo da ~24.000 a ~1.000-3.000 ticker prima del download
+triennale, mantenendo i costi API ragionevoli.
+
+No options data. No hard stop logic.
 """
 
-import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-BASE_URL            = "https://eodhd.com/api"
-REQUEST_TIMEOUT     = 30
-MAX_RETRIES         = 3
-RETRY_BASE_BACKOFF  = 2.0
-SCREENER_PAGE_SIZE  = 100
+# -- Constants -----------------------------------------------------------------
+BASE_URL           = "https://eodhd.com/api"
+REQUEST_TIMEOUT    = 60
+MAX_RETRIES        = 3
+RETRY_BASE_BACKOFF = 2.0
 
-# Stringa per la normalizzazione degli exchange US.
-# EODHD può restituire: "NYSE", "NASDAQ", "NASDAQ GS", "NasdaqGS",
-# "NYSE MKT", "AMEX", "BATS", "US", ecc.
-# Usiamo contains case-insensitive su parole chiave invece di exact-match.
-US_EXCHANGE_KEYWORDS = ["nyse", "nasdaq", "amex", "bats", "arca", "otc", "pink", "us"]
+# Exchange primari US (esclude PINK, OTC, OTCQB, OTCGREY, OTCCE)
+PRIMARY_US_EXCHANGES = {
+    "NYSE", "NASDAQ", "NYSE ARCA", "BATS",
+    "NYSE MKT", "AMEX", "NYSE American", "CBOE",
+}
 
-# Country field che EODHD può restituire per titoli USA
-US_COUNTRIES = {"USA", "US", "United States", "united states", "us", "usa"}
-
-# Tipo strumento (campo "type" nel response EODHD)
 VALID_TYPES = {"Common Stock", "ETF"}
 
-# Soglie market_cap da provare in auto-detection (ordine: USD, migliaia, milioni)
-# EODHD All-In-One restituisce market_capitalization in USD nella risposta screener.
-# Il filtro però potrebbe interpretare valori enormi come overflow → proviamo le tre scale.
-_CAP_PROBES = [
-    2_000_000_000,   # USD puri (standard EODHD All-In-One)
-    2_000_000,       # migliaia di USD
-    2_000,           # milioni di USD
-]
-_CAP_PROBE_PLAUSIBLE_MIN = 300    # almeno 300 ticker US con market_cap > $2B
-_CAP_PROBE_PLAUSIBLE_MAX = 5_000  # sanity cap
+# Pre-filtro volume sull'ultimo giorno (conservative - ADV 1.5M fara' il lavoro duro)
+MIN_VOLUME_PREFILTER = 100_000
 
 
-# ── Custom exception ──────────────────────────────────────────────────────────
+# -- Custom exception ----------------------------------------------------------
 class EODHDError(Exception):
     """Raised when an EODHD API call fails after all retries."""
 
 
-# ── Low-level HTTP ────────────────────────────────────────────────────────────
-def _get_json(url: str, params: dict, max_retries: int = MAX_RETRIES) -> object:
-    """GET request con exponential-backoff retry. Raise EODHDError on failure."""
+# -- Low-level HTTP ------------------------------------------------------------
+def _get_json(url, params, max_retries=MAX_RETRIES):
+    """GET con exponential-backoff retry. Raise EODHDError on failure."""
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 429:
                 wait = RETRY_BASE_BACKOFF ** (attempt + 1)
-                logger.warning(f"Rate limit 429 — attendo {wait:.0f}s (attempt {attempt+1})")
+                logger.warning("Rate limit 429 - attendo %.0fs", wait)
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.JSONDecodeError as e:
-            logger.warning(f"JSON decode error attempt {attempt+1}: {e}")
+            logger.warning("JSON decode error attempt %d: %s", attempt + 1, e)
         except requests.exceptions.HTTPError as e:
             if attempt == max_retries - 1:
-                raise EODHDError(f"HTTP error: {e}") from e
+                raise EODHDError("HTTP error: {}".format(e)) from e
             time.sleep(RETRY_BASE_BACKOFF)
         except requests.exceptions.RequestException as e:
             if attempt == max_retries - 1:
-                raise EODHDError(f"Request failed: {e}") from e
-            wait = RETRY_BASE_BACKOFF * (attempt + 1)
-            logger.warning(f"Request error, wait {wait}s: {e}")
-            time.sleep(wait)
-    raise EODHDError(f"Failed GET {url} after {max_retries} attempts")
+                raise EODHDError("Request failed: {}".format(e)) from e
+            time.sleep(RETRY_BASE_BACKOFF * (attempt + 1))
+    raise EODHDError("Failed GET {} after {} attempts".format(url, max_retries))
 
 
-# ── Helpers per classificazione US ───────────────────────────────────────────
-def _is_us_exchange(exchange_str: str) -> bool:
-    """
-    Restituisce True se la stringa exchange appartiene a un mercato US.
-    Usa contains case-insensitive su keyword invece di exact-match,
-    perché EODHD restituisce valori eterogenei ("NASDAQ GS", "NasdaqGS", ecc.).
-    """
-    if not exchange_str or not isinstance(exchange_str, str):
-        return False
-    exc_lower = exchange_str.lower().strip()
-    return any(kw in exc_lower for kw in US_EXCHANGE_KEYWORDS)
-
-
-def _is_us_country(country_str: str) -> bool:
-    """Restituisce True se il campo country indica USA."""
-    if not country_str or not isinstance(country_str, str):
-        return False
-    return country_str.strip() in US_COUNTRIES
-
-
-# ── EODHD Client ──────────────────────────────────────────────────────────────
+# -- EODHD Client --------------------------------------------------------------
 class EODHDClient:
     """
     Client EODHD All-In-One.
 
-    Usage
-    -----
-    client   = EODHDClient(api_token=os.environ["EODHD_API_KEY"])
-    universe = client.get_universe()
-    ohlcv    = client.get_bulk_ohlcv(universe["ticker"].tolist(), "2021-01-01", "2024-12-31")
-    earnings = client.get_upcoming_earnings(universe["ticker"].tolist())
+    Utilizzo:
+        client   = EODHDClient(api_token=os.environ["EODHD_API_KEY"])
+        universe = client.get_universe()
+        ohlcv    = client.get_bulk_ohlcv(universe["ticker"].tolist(), ...)
+        earnings = client.get_upcoming_earnings(universe["ticker"].tolist())
     """
 
-    def __init__(self, api_token: str) -> None:
+    def __init__(self, api_token):
         if not api_token:
             raise ValueError("EODHD API token is required.")
         self.api_token = api_token
-        self._detected_cap_threshold: Optional[int] = None  # cache auto-detection
 
-    def _p(self, **extra) -> dict:
-        """Base params dict."""
+    def _p(self, **extra):
         return {"api_token": self.api_token, "fmt": "json", **extra}
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Screener — auto-detection soglia market_cap
-    # ─────────────────────────────────────────────────────────────────────────
-    def _detect_cap_threshold(self) -> Tuple[int, int]:
+    # -- Step 1: Exchange Symbol List ------------------------------------------
+    def _fetch_exchange_symbol_list(self):
         """
-        Determina l'unità di misura di market_capitalization nel filtro screener
-        EODHD provando tre soglie diverse.
+        GET /api/exchange-symbol-list/US
 
-        Returns (threshold, total_count) con threshold plausibile,
-        oppure (2_000_000_000, 0) come fallback senza filtro.
+        Ritorna tutti i ticker listati su mercati US.
+        Filtra per exchange primari e tipo (Common Stock, ETF).
+
+        Returns DataFrame: ticker, exchange, name, type
         """
-        if self._detected_cap_threshold is not None:
-            return self._detected_cap_threshold, -1
-
-        url = f"{BASE_URL}/screener"
-        for threshold in _CAP_PROBES:
-            filters = json.dumps([["market_capitalization", ">=", threshold]])
-            params  = {
-                "api_token": self.api_token,
-                "filters":   filters,
-                "limit":     1,
-                "fmt":       "json",
-            }
-            try:
-                data  = _get_json(url, params)
-                total = int(data.get("total", 0)) if isinstance(data, dict) else 0
-                logger.info(
-                    f"Cap probe threshold={threshold:>15,} → total screener={total}"
-                )
-                if _CAP_PROBE_PLAUSIBLE_MIN <= total <= _CAP_PROBE_PLAUSIBLE_MAX:
-                    logger.info(f"Auto-detected market_cap threshold: {threshold:,}")
-                    self._detected_cap_threshold = threshold
-                    return threshold, total
-            except EODHDError as e:
-                logger.warning(f"Cap probe {threshold}: {e}")
-            time.sleep(0.5)
-
-        # Nessuna soglia plausibile → usa default USD e procede senza filtro efficace
-        logger.warning(
-            "Auto-detection market_cap fallita. "
-            "Uso threshold=2_000_000_000 e applico fallback exchange-list."
-        )
-        self._detected_cap_threshold = 2_000_000_000
-        return 2_000_000_000, 0
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Screener — fetch paginato
-    # ─────────────────────────────────────────────────────────────────────────
-    def _fetch_screener_pages(
-        self,
-        threshold: int,
-        min_market_cap_usd: float,
-    ) -> List[dict]:
-        """
-        Scarica tutte le pagine dello screener per il threshold dato.
-        Restituisce lista grezza di record dict.
-        """
-        url    = f"{BASE_URL}/screener"
-        filters = json.dumps([["market_capitalization", ">=", threshold]])
-
-        all_records: List[dict] = []
-        offset = 0
-
-        while True:
-            params = {
-                "api_token": self.api_token,
-                "filters":   filters,
-                "limit":     SCREENER_PAGE_SIZE,
-                "offset":    offset,
-                "sort":      "market_capitalization.desc",
-                "fmt":       "json",
-            }
-            try:
-                data = _get_json(url, params)
-            except EODHDError as e:
-                logger.error(f"Screener page offset={offset}: {e}")
-                break
-
-            if not isinstance(data, dict):
-                logger.error(f"Risposta screener non è dict: {type(data)}")
-                break
-
-            records = data.get("data", [])
-            total   = int(data.get("total", 0))
-
-            if not records:
-                break
-
-            all_records.extend(records)
-            logger.info(
-                f"Screener page offset={offset}: "
-                f"+{len(records)} record ({len(all_records)}/{total} totali)"
-            )
-
-            if len(all_records) >= total or total == 0:
-                break
-
-            offset += SCREENER_PAGE_SIZE
-            time.sleep(0.25)
-
-        return all_records
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Exchange-symbol-list — fallback
-    # ─────────────────────────────────────────────────────────────────────────
-    def _fetch_exchange_symbol_list(self) -> pd.DataFrame:
-        """
-        Recupera la lista completa dei ticker US da /api/exchange-symbol-list/US.
-        Endpoint affidabile, restituisce TUTTI i titoli listati su mercati US.
-        Non include market cap → verrà filtrata solo per tipo.
-
-        Returns DataFrame con colonne: ticker, exchange, name, type.
-        market_cap sarà NaN (non disponibile da questo endpoint).
-        """
-        url    = f"{BASE_URL}/exchange-symbol-list/US"
-        params = {"api_token": self.api_token, "fmt": "json"}
+        url    = "{}/exchange-symbol-list/US".format(BASE_URL)
+        params = self._p()
 
         try:
             data = _get_json(url, params)
         except EODHDError as e:
-            logger.error(f"Exchange-symbol-list fallita: {e}")
+            logger.error("Exchange-symbol-list fallita: %s", e)
             return pd.DataFrame()
 
         if not isinstance(data, list) or not data:
-            logger.error(f"Exchange-symbol-list: risposta inattesa {type(data)}")
+            logger.error("Exchange-symbol-list: risposta inattesa (%s)", type(data))
             return pd.DataFrame()
 
         df = pd.DataFrame(data)
-        logger.info(f"Exchange-symbol-list US: {len(df)} ticker totali")
+        logger.info("Exchange-symbol-list US raw: %d ticker", len(df))
 
-        # Normalizza colonne
-        col_map = {"Code": "ticker", "Exchange": "exchange", "Name": "name", "Type": "type"}
+        df.columns = [c.strip() for c in df.columns]
+        col_map = {
+            "Code": "ticker", "code": "ticker",
+            "Exchange": "exchange", "exchange": "exchange",
+            "Name": "name", "name": "name",
+            "Type": "type", "type": "type",
+        }
         df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-        # Alcune versioni API usano lowercase
-        col_map_lower = {"code": "ticker", "exchange": "exchange", "name": "name", "type": "type"}
-        df = df.rename(columns={k: v for k, v in col_map_lower.items() if k in df.columns})
 
-        # Filtra tipo
+        if "exchange" in df.columns:
+            before = len(df)
+            df = df[df["exchange"].isin(PRIMARY_US_EXCHANGES)].copy()
+            logger.info(
+                "Dopo filtro exchange primari: %d ticker (scartati %d OTC/PINK)",
+                len(df), before - len(df)
+            )
+
         if "type" in df.columns:
             df = df[df["type"].isin(VALID_TYPES)].copy()
-            logger.info(f"Dopo filtro tipo (Common Stock/ETF): {len(df)} ticker")
+            logger.info("Dopo filtro tipo (Common Stock/ETF): %d ticker", len(df))
 
-        df["market_cap"] = float("nan")  # non disponibile da questo endpoint
+        df = df.dropna(subset=["ticker"])
+        df = df[df["ticker"].str.strip() != ""]
+        keep = [c for c in ["ticker", "exchange", "name", "type"] if c in df.columns]
+        return df[keep].reset_index(drop=True)
 
-        keep = [c for c in ["ticker", "exchange", "name", "type", "market_cap"] if c in df.columns]
-        df   = df[keep].dropna(subset=["ticker"])
-        df   = df[df["ticker"].str.strip() != ""]
-        return df.reset_index(drop=True)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # get_universe — metodo pubblico principale
-    # ─────────────────────────────────────────────────────────────────────────
-    def get_universe(
-        self,
-        min_market_cap: float = 2_000_000_000,
-    ) -> pd.DataFrame:
+    # -- Step 2: Bulk Last-Day EOD (pre-filtro volume) -------------------------
+    def _fetch_bulk_last_day(self):
         """
-        Recupera l'universo investibile US (Common Stock + ETF, market_cap >= $2B).
+        GET /api/eod-bulk-last-day/US
 
-        Strategia:
-          1. Auto-detect unità market_cap nel filtro screener EODHD.
-          2. Fetch paginato dallo screener.
-          3. Post-filtra per US (country USA o exchange US-based) e tipo.
-          4. Se risultato < 50 ticker, fallback su exchange-symbol-list
-             (senza filtro market_cap, che verrà applicato dopo OHLCV via ADV proxy).
+        Una singola chiamata che restituisce volume e close dell'ultimo giorno
+        di trading per TUTTI i ticker US. Usato per pre-filtrare prima del
+        download OHLCV triennale.
 
-        Returns
-        -------
-        pd.DataFrame con colonne: ticker, exchange, name, type, market_cap
+        Returns DataFrame: ticker, last_volume, last_close, [market_cap]
         """
-        # ── Step A: auto-detect soglia ────────────────────────────────────────
-        threshold, probe_total = self._detect_cap_threshold()
+        url    = "{}/eod-bulk-last-day/US".format(BASE_URL)
+        params = self._p()
 
-        # ── Step B: screener paginato ─────────────────────────────────────────
-        raw_records = self._fetch_screener_pages(threshold, min_market_cap)
-        logger.info(f"Screener: {len(raw_records)} record raw ricevuti")
+        try:
+            data = _get_json(url, params)
+        except EODHDError as e:
+            logger.warning("Bulk last-day fetch fallita: %s", e)
+            return pd.DataFrame()
 
-        if raw_records:
-            df = pd.DataFrame(raw_records)
+        if not isinstance(data, list) or not data:
+            logger.warning("Bulk last-day: risposta inattesa (%s)", type(data))
+            return pd.DataFrame()
 
-            # Normalizza nomi colonne (EODHD può usare snake_case o camelCase)
-            col_map = {
-                "code":                 "ticker",
-                "Code":                 "ticker",
-                "exchange":             "exchange",
-                "Exchange":             "exchange",
-                "name":                 "name",
-                "Name":                 "name",
-                "type":                 "type",
-                "Type":                 "type",
-                "market_capitalization":"market_cap",
-                "MarketCapitalization": "market_cap",
-                "country":              "country",
-                "Country":              "country",
-            }
-            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+        df = pd.DataFrame(data)
+        logger.info("Bulk last-day US raw: %d righe", len(df))
 
-            # ── Filtro US ─────────────────────────────────────────────────────
-            # Prova prima con country (più affidabile), poi con exchange keyword
-            has_country  = "country"  in df.columns
-            has_exchange = "exchange" in df.columns
+        df.columns = [c.strip() for c in df.columns]
+        col_map = {
+            "code": "ticker",  "Code": "ticker",
+            "volume": "last_volume", "Volume": "last_volume",
+            "close": "last_close",   "Close": "last_close",
+            "adjusted_close": "last_adj_close",
+            "market_capitalization": "market_cap",
+            "MarketCapitalization":  "market_cap",
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
-            if has_country:
-                mask_us = df["country"].apply(_is_us_country)
-                # Integra con exchange per i record senza country
-                if has_exchange:
-                    mask_us = mask_us | (df["country"].isna() & df["exchange"].apply(_is_us_exchange))
-            elif has_exchange:
-                mask_us = df["exchange"].apply(_is_us_exchange)
-            else:
-                mask_us = pd.Series([True] * len(df))  # non possiamo filtrare
+        for col in ["last_volume", "last_close", "last_adj_close", "market_cap"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            df = df[mask_us].copy()
-            logger.info(f"Dopo filtro US: {len(df)} ticker")
+        df = df.dropna(subset=["ticker"])
+        df = df[df["ticker"].str.strip() != ""]
 
-            # ── Filtro tipo ───────────────────────────────────────────────────
-            if "type" in df.columns:
-                df = df[df["type"].isin(VALID_TYPES)].copy()
-                logger.info(f"Dopo filtro tipo: {len(df)} ticker")
+        out_cols = ["ticker"] + [
+            c for c in ["last_volume", "last_close", "last_adj_close", "market_cap"]
+            if c in df.columns
+        ]
+        return df[out_cols].reset_index(drop=True)
 
-            # ── Filtro market_cap numerico ────────────────────────────────────
-            if "market_cap" in df.columns:
-                df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
-                # Applica solo se la soglia auto-detected sembra in USD puri
-                # (threshold = 2_000_000_000 → min_market_cap in USD)
-                # Per soglie più piccole (milioni/migliaia), il confronto
-                # con min_market_cap in USD non ha senso → skippa
-                if threshold == 2_000_000_000:
-                    df = df[df["market_cap"].fillna(0) >= min_market_cap].copy()
-                    logger.info(f"Dopo filtro market_cap >= {min_market_cap:,.0f}: {len(df)} ticker")
+    # -- get_universe ----------------------------------------------------------
+    def get_universe(self, min_market_cap=2_000_000_000, min_volume_prefilter=MIN_VOLUME_PREFILTER):
+        """
+        Recupera l'universo investibile US (Common Stock + ETF).
 
-            # ── Pulizia ───────────────────────────────────────────────────────
-            df = df.dropna(subset=["ticker"])
-            df = df[df["ticker"].str.strip() != ""]
+        Pipeline:
+          1. Exchange-symbol-list -> ~11.000 ticker (exchange primari, tipo OK)
+          2. Bulk last-day EOD   -> pre-filtro volume > 100K shares
+          3. Pre-filtro market_cap >= 2B (se disponibile nel bulk data)
 
-        else:
-            df = pd.DataFrame()
+        Il filtro definitivo ADV 1.5M viene applicato in quant_engine
+        sui 3 anni di OHLCV.
 
-        # ── Step C: fallback se troppo pochi ─────────────────────────────────
-        FALLBACK_THRESHOLD = 50
-        if len(df) < FALLBACK_THRESHOLD:
+        Returns DataFrame: ticker, exchange, name, type, market_cap
+        """
+        # Step 1
+        symbol_df = self._fetch_exchange_symbol_list()
+        if symbol_df.empty:
+            logger.error("Exchange-symbol-list vuota. Nessun ticker da processare.")
+            return pd.DataFrame()
+
+        n_after_exchange = len(symbol_df)
+
+        # Step 2
+        bulk_df = self._fetch_bulk_last_day()
+
+        if bulk_df.empty:
             logger.warning(
-                f"Screener ha restituito solo {len(df)} ticker dopo i filtri "
-                f"(soglia fallback = {FALLBACK_THRESHOLD}). "
-                f"Attivo fallback su exchange-symbol-list."
+                "Bulk last-day non disponibile. "
+                "Procedo con universe completo (nessun pre-filtro volume)."
             )
-            df_fallback = self._fetch_exchange_symbol_list()
+            symbol_df["market_cap"] = float("nan")
+        else:
+            symbol_df = symbol_df.merge(bulk_df, on="ticker", how="left")
 
-            if not df_fallback.empty:
-                if not df.empty:
-                    # Merge: usa screener per i ticker già trovati, aggiungi il resto
-                    existing = set(df["ticker"].tolist())
-                    new_rows = df_fallback[~df_fallback["ticker"].isin(existing)]
-                    df = pd.concat([df, new_rows], ignore_index=True)
+            # Pre-filtro volume
+            if "last_volume" in symbol_df.columns:
+                has_volume = symbol_df["last_volume"].notna().sum()
+                if has_volume > 0:
+                    before = len(symbol_df)
+                    symbol_df = symbol_df[
+                        symbol_df["last_volume"].fillna(0) >= min_volume_prefilter
+                    ].copy()
+                    logger.info(
+                        "Pre-filtro volume > %s shares: %d ticker (scartati %d)",
+                        "{:,}".format(min_volume_prefilter),
+                        len(symbol_df), before - len(symbol_df)
+                    )
                 else:
-                    df = df_fallback
+                    logger.warning("Campo 'last_volume' assente o tutti NaN nel bulk data.")
 
-                logger.info(
-                    f"Post-fallback universo: {len(df)} ticker "
-                    f"(market_cap filtro sarà applicato via ADV proxy su OHLCV)"
-                )
+            # Pre-filtro market_cap (se disponibile)
+            if "market_cap" in symbol_df.columns:
+                n_with_cap = symbol_df["market_cap"].notna().sum()
+                if n_with_cap > 100:
+                    before = len(symbol_df)
+                    mask_ok = (
+                        symbol_df["market_cap"].isna() |
+                        (symbol_df["market_cap"] >= min_market_cap)
+                    )
+                    symbol_df = symbol_df[mask_ok].copy()
+                    logger.info(
+                        "Pre-filtro market_cap >= $%s (%d con dato): %d ticker (scartati %d)",
+                        "{:,.0f}".format(min_market_cap), n_with_cap,
+                        len(symbol_df), before - len(symbol_df)
+                    )
+                else:
+                    logger.info(
+                        "market_cap disponibile per soli %d ticker - pre-filtro cap saltato.",
+                        n_with_cap
+                    )
+            else:
+                symbol_df["market_cap"] = float("nan")
 
-        # ── Step D: colonne finali ────────────────────────────────────────────
+        # Pulizia finale
+        drop_cols = [c for c in ["last_volume", "last_close", "last_adj_close"]
+                     if c in symbol_df.columns]
+        symbol_df = symbol_df.drop(columns=drop_cols, errors="ignore")
+
         for col in ["market_cap", "name", "type", "exchange"]:
-            if col not in df.columns:
-                df[col] = float("nan") if col == "market_cap" else ""
+            if col not in symbol_df.columns:
+                symbol_df[col] = float("nan") if col == "market_cap" else ""
 
         keep = ["ticker", "exchange", "name", "type", "market_cap"]
-        df   = df[keep].drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+        symbol_df = (
+            symbol_df[keep]
+            .drop_duplicates(subset=["ticker"])
+            .reset_index(drop=True)
+        )
 
-        logger.info(f"Universo finale: {len(df)} ticker (Common Stock + ETF, US)")
-        return df
+        logger.info(
+            "Universo finale: %d ticker (da %d post-exchange-filter)",
+            len(symbol_df), n_after_exchange
+        )
+        return symbol_df
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # OHLCV — singolo ticker
-    # ─────────────────────────────────────────────────────────────────────────
-    def get_ohlcv(
-        self,
-        ticker: str,
-        from_date: Optional[str] = None,
-        to_date: Optional[str]   = None,
-    ) -> pd.DataFrame:
+    # -- OHLCV: singolo ticker -------------------------------------------------
+    def get_ohlcv(self, ticker, from_date=None, to_date=None):
         """
-        Fetch daily adjusted OHLCV per un ticker US.
-        EODHD usa il formato "{TICKER}.US" per tutti i titoli listati su mercati US.
+        GET /api/eod/{ticker}.US - daily adjusted OHLCV.
 
-        Returns DataFrame con colonne: date, open, high, low, close,
-        adjusted_close, volume — ordinato ascending per date.
-        Ritorna DataFrame vuoto in caso di errore.
+        Returns DataFrame: date, open, high, low, close, adjusted_close, volume
+        Ordinato ascending per date. DataFrame vuoto su errore.
         """
-        symbol = f"{ticker}.US"
-        url    = f"{BASE_URL}/eod/{symbol}"
-        params = self._p(adjusted_close="true")
-        del params["fmt"]
-        params["fmt"] = "json"
+        url    = "{}/eod/{}.US".format(BASE_URL, ticker)
+        params = {"api_token": self.api_token, "fmt": "json", "adjusted_close": "true"}
         if from_date:
             params["from"] = from_date
         if to_date:
@@ -433,7 +311,7 @@ class EODHDClient:
         try:
             data = _get_json(url, params)
         except EODHDError as e:
-            logger.debug(f"OHLCV fetch failed {ticker}: {e}")
+            logger.debug("OHLCV %s: %s", ticker, e)
             return pd.DataFrame()
 
         if not data or not isinstance(data, list):
@@ -444,11 +322,11 @@ class EODHDClient:
             return df
 
         df.columns = [c.lower() for c in df.columns]
-        df = df.rename(columns={
-            "date": "date", "open": "open", "high": "high",
-            "low": "low", "close": "close",
-            "adjusted_close": "adjusted_close", "volume": "volume",
-        })
+        rename = {
+            "date": "date", "open": "open", "high": "high", "low": "low",
+            "close": "close", "adjusted_close": "adjusted_close", "volume": "volume",
+        }
+        df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
 
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         for col in ["open", "high", "low", "close", "adjusted_close", "volume"]:
@@ -456,27 +334,17 @@ class EODHDClient:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.dropna(subset=["date", "adjusted_close"])
-        df = df.sort_values("date").reset_index(drop=True)
-        return df
+        return df.sort_values("date").reset_index(drop=True)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # OHLCV — bulk parallelo
-    # ─────────────────────────────────────────────────────────────────────────
-    def get_bulk_ohlcv(
-        self,
-        tickers: List[str],
-        from_date: str,
-        to_date: str,
-        max_workers: int  = 5,
-        inter_request_delay: float = 0.1,
-    ) -> Dict[str, pd.DataFrame]:
+    # -- OHLCV: bulk parallelo -------------------------------------------------
+    def get_bulk_ohlcv(self, tickers, from_date, to_date,
+                       max_workers=5, inter_request_delay=0.1):
         """
         Fetch OHLCV per N ticker in parallelo con ThreadPoolExecutor.
-
         Returns dict: {ticker: pd.DataFrame}
         """
-        results: Dict[str, pd.DataFrame] = {}
-        total = len(tickers)
+        results = {}
+        total   = len(tickers)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_ticker = {}
@@ -491,32 +359,21 @@ class EODHDClient:
                 try:
                     results[ticker] = future.result()
                 except Exception as e:
-                    logger.warning(f"Unexpected error {ticker}: {e}")
+                    logger.warning("Error %s: %s", ticker, e)
                     results[ticker] = pd.DataFrame()
 
                 completed += 1
                 if completed % 100 == 0 or completed == total:
                     success = sum(1 for d in results.values() if not d.empty)
-                    logger.info(
-                        f"OHLCV progress: {completed}/{total} "
-                        f"({success} con dati)"
-                    )
+                    logger.info("OHLCV: %d/%d (%d con dati)", completed, total, success)
 
         return results
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Earnings calendar
-    # ─────────────────────────────────────────────────────────────────────────
-    def get_upcoming_earnings(
-        self,
-        tickers: List[str],
-        days_ahead: int = 90,
-    ) -> Dict[str, Optional[str]]:
+    # -- Earnings calendar -----------------------------------------------------
+    def get_upcoming_earnings(self, tickers, days_ahead=90):
         """
-        Fetch prossima data earnings per una lista di ticker US.
-        Usa EODHD /api/calendar/earnings con range [oggi, oggi+days_ahead].
-
-        Returns dict: {ticker: "YYYY-MM-DD"} o {ticker: None}.
+        GET /api/calendar/earnings - prossima data earnings per lista ticker US.
+        Batch da 50 simboli. Returns {ticker: "YYYY-MM-DD"} o {ticker: None}.
         """
         if not tickers:
             return {}
@@ -524,32 +381,28 @@ class EODHDClient:
         today       = datetime.utcnow().date()
         future_date = today + timedelta(days=days_ahead)
         BATCH_SIZE  = 50
-        earnings_map: Dict[str, Optional[str]] = {t: None for t in tickers}
+        earnings_map = {t: None for t in tickers}
         batches = [tickers[i: i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
 
-        for batch_idx, batch in enumerate(batches):
-            symbols_str = ",".join(f"{t}.US" for t in batch)
-            url         = f"{BASE_URL}/calendar/earnings"
-            params      = self._p(
-                **{
-                    "from":    today.isoformat(),
-                    "to":      future_date.isoformat(),
-                    "symbols": symbols_str,
-                }
-            )
-
+        for idx, batch in enumerate(batches):
+            symbols_str = ",".join("{}.US".format(t) for t in batch)
+            params = {
+                "api_token": self.api_token, "fmt": "json",
+                "from": today.isoformat(), "to": future_date.isoformat(),
+                "symbols": symbols_str,
+            }
             try:
-                data = _get_json(url, params)
+                data = _get_json("{}/calendar/earnings".format(BASE_URL), params)
             except EODHDError as e:
-                logger.warning(f"Earnings batch {batch_idx+1}: {e}")
+                logger.warning("Earnings batch %d: %s", idx + 1, e)
                 continue
 
             if not isinstance(data, dict):
                 continue
 
             for entry in data.get("earnings", []):
-                code   = entry.get("code", "")
-                ticker = code.split(".")[0].upper()
+                code        = entry.get("code", "")
+                ticker      = code.split(".")[0].upper()
                 report_date = entry.get("report_date") or entry.get("date")
                 if ticker in earnings_map and report_date:
                     existing = earnings_map[ticker]
@@ -557,8 +410,8 @@ class EODHDClient:
                         earnings_map[ticker] = str(report_date)
 
             time.sleep(0.3)
-            logger.info(f"Earnings calendar: batch {batch_idx+1}/{len(batches)}")
+            logger.info("Earnings: batch %d/%d", idx + 1, len(batches))
 
         found = sum(1 for v in earnings_map.values() if v is not None)
-        logger.info(f"Earnings date trovate: {found}/{len(tickers)} ticker")
+        logger.info("Earnings trovate: %d/%d ticker", found, len(tickers))
         return earnings_map
