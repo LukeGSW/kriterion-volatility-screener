@@ -369,6 +369,143 @@ class EODHDClient:
 
         return results
 
+    # -- Market cap da fundamentals -------------------------------------------
+    def _get_single_market_cap(self, ticker):
+        """
+        GET /api/fundamentals/{ticker}.US?filter=General::MarketCapitalization
+        Restituisce float o NaN.
+        """
+        url    = "{}/fundamentals/{}.US".format(BASE_URL, ticker)
+        params = {
+            "api_token": self.api_token,
+            "fmt":       "json",
+            "filter":    "General::MarketCapitalization",
+        }
+        try:
+            data = _get_json(url, params, max_retries=2)
+            # L'endpoint con filter= può restituire un numero nudo o un dict
+            if isinstance(data, (int, float)) and data > 0:
+                return float(data)
+            if isinstance(data, dict):
+                val = data.get("MarketCapitalization") or data.get("market_capitalization")
+                if val is not None:
+                    return float(val)
+            return float("nan")
+        except (EODHDError, ValueError, TypeError):
+            return float("nan")
+
+    def get_market_caps(self, tickers, max_workers=10, inter_request_delay=0.05):
+        """
+        Recupera la market capitalization da /api/fundamentals per una lista di ticker.
+
+        Parallelizzato. Chiamata solo sui ticker qualificati (~200-1600),
+        non sull'intero universo.
+
+        Returns dict: {ticker: float}  (float("nan") se non disponibile)
+        """
+        if not tickers:
+            return {}
+
+        results = {}
+        total   = len(tickers)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_ticker = {}
+            for ticker in tickers:
+                fut = executor.submit(self._get_single_market_cap, ticker)
+                future_to_ticker[fut] = ticker
+                time.sleep(inter_request_delay)
+
+            completed = 0
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    results[ticker] = future.result()
+                except Exception as e:
+                    logger.debug("MarketCap %s: %s", ticker, e)
+                    results[ticker] = float("nan")
+
+                completed += 1
+                if completed % 200 == 0 or completed == total:
+                    found = sum(1 for v in results.values()
+                                if isinstance(v, float) and not (v != v))  # not NaN
+                    logger.info(
+                        "MarketCap: %d/%d (%d con dato)", completed, total, found
+                    )
+
+        found = sum(
+            1 for v in results.values()
+            if isinstance(v, float) and v > 0 and v == v  # > 0 and not NaN
+        )
+        logger.info("Market cap recuperata per %d/%d ticker", found, total)
+        return results
+
+    # -- Earnings calendar -----------------------------------------------------
+    def get_upcoming_earnings(self, tickers, days_ahead=90):
+        """
+        GET /api/calendar/earnings - prossima data earnings per lista ticker US.
+        Batch da 50 simboli. Returns {ticker: "YYYY-MM-DD"} o {ticker: None}.
+        """
+        if not tickers:
+            return {}
+
+        today       = datetime.utcnow().date()
+        future_date = today + timedelta(days=days_ahead)
+        BATCH_SIZE  = 50
+        earnings_map = {t: None for t in tickers}
+        batches = [tickers[i: i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
+
+        for idx, batch in enumerate(batches):
+            symbols_str = ",".join("{}.US".format(t) for t in batch)
+            params = {
+                "api_token": self.api_token, "fmt": "json",
+                "from": today.isoformat(), "to": future_date.isoformat(),
+                "symbols": symbols_str,
+            }
+            try:
+                data = _get_json("{}/calendar/earnings".format(BASE_URL), params)
+            except EODHDError as e:
+                logger.warning("Earnings batch %d: %s", idx + 1, e)
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            for entry in data.get("earnings", []):
+                code        = entry.get("code", "")
+                ticker      = code.split(".")[0].upper()
+                report_date = entry.get("report_date") or entry.get("date")
+                if ticker in earnings_map and report_date:
+                    existing = earnings_map[ticker]
+                    if existing is None or str(report_date) < str(existing):
+                        earnings_map[ticker] = str(report_date)
+
+            time.sleep(0.3)
+            logger.info("Earnings: batch %d/%d", idx + 1, len(batches))
+
+        found = sum(1 for v in earnings_map.values() if v is not None)
+        logger.info("Earnings trovate: %d/%d ticker", found, len(tickers))
+        return earnings_map
+ = future.result()
+                except Exception as e:
+                    logger.debug("MarketCap %s: %s", ticker, e)
+                    results[ticker] = float("nan")
+
+                completed += 1
+                if completed % 200 == 0 or completed == total:
+                    found = sum(1 for v in results.values()
+                                if isinstance(v, float) and v == v and v > 0)
+                    logger.info(
+                        "MarketCap: %d/%d (%d con dato)", completed, total, found
+                    )
+
+        found = sum(
+            1 for v in results.values()
+            if isinstance(v, float) and v > 0 and v == v
+        )
+        logger.info("Market cap recuperata per %d/%d ticker", found, total)
+        return results
+
     # -- Earnings calendar -----------------------------------------------------
     def get_upcoming_earnings(self, tickers, days_ahead=90):
         """
