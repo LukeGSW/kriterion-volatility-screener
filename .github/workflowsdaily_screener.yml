@@ -4,7 +4,7 @@ name: Daily Volatility Screener
 on:
   schedule:
     # 22:00 UTC = 18:00 ET (estate) / 17:00 ET (inverno) — dopo chiusura mercato USA
-    - cron: "0 22 * * 1-5"
+    - cron: "0 23 * * 1-5"
 
   # Trigger manuale per test o run fuori-schedule
   workflow_dispatch:
