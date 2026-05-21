@@ -296,32 +296,3 @@ def run_pipeline() -> None:
 
 if __name__ == "__main__":
     run_pipeline()
-   "tickers_scanned":        n_universe,
-        "tickers_with_data":      n_with_data,
-        "tickers_passed_filters": n_qualified,
-        "tickers_compressed":     n_compressed,
-        "rv_window":              RV_WINDOW,
-        "percentile_lookback":    PERCENTILE_LOOKBACK,
-        "compression_threshold":  COMPRESSION_THRESHOLD,
-        "min_market_cap":         MIN_MARKET_CAP,
-        "min_adv":                MIN_ADV,
-        "history_years":          HISTORY_YEARS,
-        "history_buffer_days":    HISTORY_BUFFER_DAYS,
-        "from_date":              from_date,
-        "to_date":                to_date,
-    }
-
-    _save_results(results_df, metadata)
-
-    logger.info("=" * 65)
-    logger.info(
-        f"  SUMMARY: {n_universe} scansionati | "
-        f"{n_with_data} con dati | "
-        f"{n_qualified} qualificati | "
-        f"{n_compressed} COMPRESSI (≤{COMPRESSION_THRESHOLD}° pct)"
-    )
-    logger.info("=" * 65)
-
-
-if __name__ == "__main__":
-    run_pipeline()
