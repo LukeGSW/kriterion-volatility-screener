@@ -396,7 +396,8 @@ def main() -> None:
     filt = filt[filt["rv_percentile"] <= max_pct]
 
     if "market_cap" in filt.columns:
-        filt = filt[filt["market_cap"].fillna(0) >= min_cap]
+        has_cap = filt["market_cap"].notna()
+        filt = filt[~has_cap | (filt["market_cap"] >= min_cap)]
 
     if type_sel != "Tutti" and "type" in filt.columns:
         filt = filt[filt["type"] == type_sel]
