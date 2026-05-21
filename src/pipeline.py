@@ -210,29 +210,14 @@ def run_pipeline() -> None:
         # Porta name e type da universe_df.
         # market_cap NON viene da universe_df (bulk-last-day spesso non la restituisce):
         # viene recuperata separatamente dal fundamentals endpoint nello step 6b.
-        meta_cols = [c for c in ["ticker", "name", "type"]
+        meta_cols = [c for c in ["ticker", "name", "type", "market_cap"]
                      if c in universe_df.columns]
         results_df = results_df.merge(
             universe_df[meta_cols], on="ticker", how="left"
         )
 
-    # ── Step 6b: Market cap da fundamentals ───────────────────────────────────
-    if not results_df.empty:
-        qualified_tickers = results_df["ticker"].tolist()
-        logger.info(
-            f"[6/7] Fetch market cap da fundamentals "
-            f"per {len(qualified_tickers)} ticker qualificati..."
-        )
-        cap_map = client.get_market_caps(
-            tickers=qualified_tickers,
-            max_workers=10,
-            inter_request_delay=0.05,
-        )
-        results_df["market_cap"] = results_df["ticker"].map(cap_map)
-        n_with_cap = results_df["market_cap"].notna().sum()
-        logger.info(
-            f"Market cap disponibile per {n_with_cap}/{len(results_df)} ticker"
-        )
+    # ── Step 6b: Market cap da fundamentals (Eliminato) ───────────────────────────────────
+
 
     # ── Step 6c: Earnings calendar ────────────────────────────────────────────
     if not results_df.empty:
