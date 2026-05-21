@@ -1,0 +1,98 @@
+name: Daily Volatility Screener
+
+# ── Trigger ───────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    # 22:00 UTC = 18:00 ET (estate) / 17:00 ET (inverno) — dopo chiusura mercato USA
+    - cron: "0 22 * * 1-5"
+
+  # Trigger manuale per test o run fuori-schedule
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Motivo del run manuale (opzionale)"
+        required: false
+        default: "Manual trigger"
+
+# ── Permessi ──────────────────────────────────────────────────────────────────
+# write necessario per il commit automatico del dataset nella repo
+permissions:
+  contents: write
+
+# ── Variabili globali ─────────────────────────────────────────────────────────
+env:
+  PYTHON_VERSION: "3.11"
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+jobs:
+  run-screener:
+    name: "Volatility Compression Screener"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # 2 ore: sufficiente per 500-800 ticker in parallelo
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Token con write access per il commit successivo
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      # ── 2. Python setup ───────────────────────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      # ── 3. Installazione dipendenze ───────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. Verifica API key ───────────────────────────────────────────────────
+      - name: Verify EODHD API key is set
+        run: |
+          if [ -z "${{ secrets.EODHD_API_KEY }}" ]; then
+            echo "::error::EODHD_API_KEY secret non configurato. Vai su Settings → Secrets → Actions."
+            exit 1
+          fi
+          echo "API key presente."
+
+      # ── 5. Esecuzione screener ────────────────────────────────────────────────
+      - name: Run screening pipeline
+        env:
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+        run: |
+          python src/pipeline.py
+
+      # ── 6. Commit e push del dataset aggiornato ───────────────────────────────
+      - name: Commit screener results to repository
+        run: |
+          git config --local user.name  "Kriterion Quant Bot"
+          git config --local user.email "bot@kriterionquant.com"
+
+          # Aggiungi solo la directory data/
+          git add data/
+
+          # Commit solo se ci sono modifiche effettive
+          if git diff --staged --quiet; then
+            echo "Nessuna variazione nei dati — commit skippato."
+          else
+            TIMESTAMP=$(date -u +'%Y-%m-%d %H:%M UTC')
+            git commit -m "data: screener update ${TIMESTAMP} [skip ci]"
+            git push
+            echo "Dataset committato con successo."
+          fi
+
+      # ── 7. Summary artifacts (log run) ────────────────────────────────────────
+      - name: Upload run metadata as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-metadata-${{ github.run_id }}
+          path: data/run_metadata.json
+          retention-days: 30
+          if-no-files-found: ignore
