@@ -207,16 +207,37 @@ def run_pipeline() -> None:
     # ── Step 6a: Metadati universo ────────────────────────────────────────────
     if not results_df.empty:
         logger.info(f"[6/7] Arricchimento metadati per {len(results_df)} ticker...")
-        meta_cols = [c for c in ["ticker", "market_cap", "name", "type"]
+        # Porta name e type da universe_df.
+        # market_cap NON viene da universe_df (bulk-last-day spesso non la restituisce):
+        # viene recuperata separatamente dal fundamentals endpoint nello step 6b.
+        meta_cols = [c for c in ["ticker", "name", "type"]
                      if c in universe_df.columns]
         results_df = results_df.merge(
             universe_df[meta_cols], on="ticker", how="left"
         )
 
-    # ── Step 6b: Earnings calendar ────────────────────────────────────────────
+    # ── Step 6b: Market cap da fundamentals ───────────────────────────────────
+    if not results_df.empty:
+        qualified_tickers = results_df["ticker"].tolist()
+        logger.info(
+            f"[6/7] Fetch market cap da fundamentals "
+            f"per {len(qualified_tickers)} ticker qualificati..."
+        )
+        cap_map = client.get_market_caps(
+            tickers=qualified_tickers,
+            max_workers=10,
+            inter_request_delay=0.05,
+        )
+        results_df["market_cap"] = results_df["ticker"].map(cap_map)
+        n_with_cap = results_df["market_cap"].notna().sum()
+        logger.info(
+            f"Market cap disponibile per {n_with_cap}/{len(results_df)} ticker"
+        )
+
+    # ── Step 6c: Earnings calendar ────────────────────────────────────────────
     if not results_df.empty:
         logger.info(
-            f"[6/7] Earnings calendar "
+            f"[6c/7] Earnings calendar "
             f"(prossimi {EARNINGS_DAYS_AHEAD}gg) per {len(results_df)} ticker..."
         )
         earnings_map = client.get_upcoming_earnings(
@@ -247,6 +268,35 @@ def run_pipeline() -> None:
     metadata = {
         "run_timestamp":          run_ts.isoformat(),
         "tickers_scanned":        n_universe,
+        "tickers_with_data":      n_with_data,
+        "tickers_passed_filters": n_qualified,
+        "tickers_compressed":     n_compressed,
+        "rv_window":              RV_WINDOW,
+        "percentile_lookback":    PERCENTILE_LOOKBACK,
+        "compression_threshold":  COMPRESSION_THRESHOLD,
+        "min_market_cap":         MIN_MARKET_CAP,
+        "min_adv":                MIN_ADV,
+        "history_years":          HISTORY_YEARS,
+        "history_buffer_days":    HISTORY_BUFFER_DAYS,
+        "from_date":              from_date,
+        "to_date":                to_date,
+    }
+
+    _save_results(results_df, metadata)
+
+    logger.info("=" * 65)
+    logger.info(
+        f"  SUMMARY: {n_universe} scansionati | "
+        f"{n_with_data} con dati | "
+        f"{n_qualified} qualificati | "
+        f"{n_compressed} COMPRESSI (≤{COMPRESSION_THRESHOLD}° pct)"
+    )
+    logger.info("=" * 65)
+
+
+if __name__ == "__main__":
+    run_pipeline()
+   "tickers_scanned":        n_universe,
         "tickers_with_data":      n_with_data,
         "tickers_passed_filters": n_qualified,
         "tickers_compressed":     n_compressed,
