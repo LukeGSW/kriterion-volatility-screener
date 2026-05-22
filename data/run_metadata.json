@@ -1,9 +1,9 @@
 {
-  "run_timestamp": "2026-05-21T22:57:26.738782",
-  "tickers_scanned": 2033,
-  "tickers_with_data": 2033,
-  "tickers_passed_filters": 983,
-  "tickers_compressed": 14,
+  "run_timestamp": "2026-05-22T22:49:14.194681",
+  "tickers_scanned": 2027,
+  "tickers_with_data": 2027,
+  "tickers_passed_filters": 986,
+  "tickers_compressed": 13,
   "rv_window": 90,
   "percentile_lookback": 756,
   "compression_threshold": 5.0,
@@ -11,6 +11,6 @@
   "min_adv": 1500000,
   "history_years": 3,
   "history_buffer_days": 365,
-  "from_date": "2022-05-22",
-  "to_date": "2026-05-21"
+  "from_date": "2022-05-23",
+  "to_date": "2026-05-22"
 }
