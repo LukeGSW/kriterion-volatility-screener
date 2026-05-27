@@ -422,7 +422,7 @@ def main() -> None:
         cap_label = st.radio(
             "Market Cap",
             list(cap_map.keys()),
-            index=0,
+            index=2,
             label_visibility="collapsed",
         )
         min_cap = cap_map[cap_label]
