@@ -1,5 +1,5 @@
 """
-quant_engine.py — Motore matematico e quantitativo del Kriterion Quant Screener.
+quant_engine.py - Motore matematico e quantitativo del Kriterion Quant Screener.
 
 Implementa (completamente vettorizzato con pandas/numpy):
   A. Rendimenti logaritmici giornalieri
@@ -10,6 +10,7 @@ Implementa (completamente vettorizzato con pandas/numpy):
   F. Term Structure RV (rv_20 / rv_60) come proxy di squeeze attivo
   G. Expansion Ratio (rv_52w_max / rv_current) con classificazione tier
   H. Borda ranking aggregato per selezione candidati Long Straddle
+  I. Deal-Pending detector: identifica titoli oggetto di acquisizione
 
 Nessuna logica di hard stop. Nessuna chiamata a dati di opzioni.
 """
@@ -49,6 +50,20 @@ STRADDLE_GATE_PCT: float     = 20.0    # Gate RV percentile per candidati stradd
 EXPANSION_TIER_LOW: float    = 2.0
 EXPANSION_TIER_MEDIUM: float = 3.0
 EXPANSION_TIER_HIGH: float   = 4.5
+
+# ── Deal-Pending detector ─────────────────────────────────────────────────────
+# Identifica titoli oggetto di acquisizione con deal price definito.
+# Questi titoli mostrano una firma statistica inequivocabile:
+#   - Price pinning estremo (close clustered intorno al deal price)
+#   - Range giornaliero collassato (arbitraggio meccanico)
+#   - Volume spike storico (giorno dell'annuncio)
+# Sono i PEGGIORI candidati per Long Straddle: vol-dead per natura.
+DEAL_CV_WINDOW: int                = 30      # giorni per CV close
+DEAL_RANGE_WINDOW: int             = 20      # giorni per range relativo
+DEAL_VOLUME_WINDOW: int            = 180     # giorni per volume spike (~6m)
+DEAL_CV_THRESHOLD: float           = 0.005   # CV close < 0.5%  → price pinning
+DEAL_RANGE_THRESHOLD: float        = 0.008   # range medio < 0.8% → range collassato
+DEAL_VOLUME_SPIKE_THRESHOLD: float = 5.0     # max/median volume > 5x → spike annuncio
 
 # Storia minima in valori RV validi (non righe raw).
 MIN_VALID_RV_VALUES: int = PERCENTILE_LOOKBACK  # 756 valori RV non-NaN
@@ -231,6 +246,102 @@ def classify_expansion_tier(ratio: float) -> str:
     return "HIGH"
 
 
+# ── Deal-Pending detector ─────────────────────────────────────────────────────
+def compute_deal_pending_signals(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    volume: pd.Series,
+    cv_window: int           = DEAL_CV_WINDOW,
+    range_window: int        = DEAL_RANGE_WINDOW,
+    volume_window: int       = DEAL_VOLUME_WINDOW,
+    cv_threshold: float      = DEAL_CV_THRESHOLD,
+    range_threshold: float   = DEAL_RANGE_THRESHOLD,
+    vol_spike_threshold: float = DEAL_VOLUME_SPIKE_THRESHOLD,
+) -> dict:
+    """
+    Rileva titoli "deal-pending" (oggetto di acquisizione con prezzo definito).
+
+    Calcola tre signature statistiche:
+      1. CV close (Coefficient of Variation) sugli ultimi cv_window giorni:
+         std(close) / mean(close). Valori molto bassi indicano price pinning.
+      2. Range relativo medio sugli ultimi range_window giorni:
+         mean((H - L) / Close). Valori bassi indicano range giornaliero collassato.
+      3. Volume spike sugli ultimi volume_window giorni:
+         max(volume) / median(volume). Valori alti indicano un evento
+         (tipicamente l'annuncio del deal).
+
+    Il flag is_deal_pending e' True quando TUTTE e tre le condizioni sono soddisfatte
+    simultaneamente — combinazione che è praticamente esclusiva dei deal-pending.
+
+    Returns
+    -------
+    dict con keys: cv_30, range_rel_20, volume_spike_180, is_deal_pending
+    """
+    # CV close
+    recent_close = close.tail(cv_window)
+    if len(recent_close) < cv_window:
+        cv = None
+    else:
+        mu = recent_close.mean()
+        if mu is None or pd.isna(mu) or mu == 0:
+            cv = None
+        else:
+            sigma = recent_close.std()
+            cv = float(sigma / mu) if pd.notna(sigma) else None
+
+    # Range relativo medio
+    recent_high  = high.tail(range_window)
+    recent_low   = low.tail(range_window)
+    recent_cls   = close.tail(range_window)
+    if (
+        len(recent_high) < range_window
+        or len(recent_low) < range_window
+        or len(recent_cls) < range_window
+    ):
+        rr = None
+    else:
+        # Mantieni solo righe con close > 0 e high/low validi
+        valid_mask = (recent_cls > 0) & recent_high.notna() & recent_low.notna()
+        if valid_mask.sum() < range_window // 2:
+            rr = None
+        else:
+            rng_rel = (
+                (recent_high[valid_mask] - recent_low[valid_mask])
+                / recent_cls[valid_mask]
+            )
+            rr = float(rng_rel.mean()) if not rng_rel.empty else None
+
+    # Volume spike
+    recent_vol = volume.tail(volume_window)
+    valid_vol  = recent_vol[recent_vol > 0]
+    if len(valid_vol) < volume_window // 2:
+        vs = None
+    else:
+        med = valid_vol.median()
+        if med is None or pd.isna(med) or med == 0:
+            vs = None
+        else:
+            vs = float(valid_vol.max() / med)
+
+    # Flag combinato: serve TUTTE e tre le condizioni
+    if cv is None or rr is None or vs is None:
+        is_deal_pending = False
+    else:
+        is_deal_pending = bool(
+            cv < cv_threshold
+            and rr < range_threshold
+            and vs > vol_spike_threshold
+        )
+
+    return {
+        "cv_30":            round(cv, 5) if cv is not None else None,
+        "range_rel_20":     round(rr, 5) if rr is not None else None,
+        "volume_spike_180": round(vs, 2) if vs is not None else None,
+        "is_deal_pending":  is_deal_pending,
+    }
+
+
 # ── Per-ticker full analysis ──────────────────────────────────────────────────
 def analyze_ticker(
     ticker: str,
@@ -334,6 +445,12 @@ def analyze_ticker(
     # ── ATR(14)/Close e percentile 252gg ──────────────────────────────────────
     atr_pct_current   = None
     atr_pct_pctile    = None
+    deal_signals: dict = {
+        "cv_30": None,
+        "range_rel_20": None,
+        "volume_spike_180": None,
+        "is_deal_pending": False,
+    }
     if has_hl:
         high = df["high"]
         low  = df["low"]
@@ -348,17 +465,22 @@ def analyze_ticker(
         if pd.notna(atr_pctile_last):
             atr_pct_pctile = round(float(atr_pctile_last), 2)
 
+        # Detector deal-pending (richiede high/low/volume)
+        deal_signals = compute_deal_pending_signals(close, high, low, volume)
+
     # ── Flag operativi ────────────────────────────────────────────────────────
-    is_compressed = float(pct_current) <= COMPRESSION_THRESHOLD
+    is_compressed   = float(pct_current) <= COMPRESSION_THRESHOLD
+    is_deal_pending = bool(deal_signals["is_deal_pending"])
 
     # Gate Long Straddle:
     #   - rv_percentile_90 ≤ STRADDLE_GATE_PCT  (regime compresso)
     #   - rv_20 < rv_60                         (term structure inversa, squeeze attivo)
+    #   - NOT is_deal_pending                   (esclude titoli oggetto di acquisizione)
     gate_pct  = float(pct_current) <= STRADDLE_GATE_PCT
     gate_term = (
         rv_term_structure is not None and rv_term_structure < 1.0
     )
-    is_straddle_candidate = bool(gate_pct and gate_term)
+    is_straddle_candidate = bool(gate_pct and gate_term and not is_deal_pending)
 
     return {
         "ticker":           ticker,
@@ -381,8 +503,13 @@ def analyze_ticker(
         "adv_90d":          round(float(adv_90)),
         "close_price":      round(float(close.iloc[-1]), 2),
         "last_date":        df.index[-1].date().isoformat(),
+        # Deal-pending detector
+        "cv_30":            deal_signals["cv_30"],
+        "range_rel_20":     deal_signals["range_rel_20"],
+        "volume_spike_180": deal_signals["volume_spike_180"],
         # Flags
         "is_compressed":         is_compressed,
+        "is_deal_pending":       is_deal_pending,
         "is_straddle_candidate": is_straddle_candidate,
     }
 
@@ -392,17 +519,17 @@ def compute_borda_ranking(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calcola il ranking Borda aggregato sui ticker candidati Long Straddle.
 
-    Tre metriche di rank (tutte ascending, rank 1 = "più estremo"):
+    Tre metriche di rank (tutte ascending, rank 1 = "piu' estremo"):
         R1 = rank(rv_percentile)         — regime compresso (lookback 3y)
         R2 = rank(atr_pct_percentile)    — ATR(14)/Close percentile 1y
-        R3 = rank(rv_term_structure)     — intensità squeeze (rv_20/rv_60)
+        R3 = rank(rv_term_structure)     — intensita' squeeze (rv_20/rv_60)
 
     Borda Rank totale = R1 + R2 + R3.
-    Più basso = candidato migliore.
+    Piu' basso = candidato migliore.
 
-    Tie-break su rv_percentile (metrica più strutturalmente robusta).
+    Tie-break su rv_percentile (metrica piu' strutturalmente robusta).
 
-    Il ranking è calcolato SOLO sui ticker che passano il gate
+    Il ranking e' calcolato SOLO sui ticker che passano il gate
     (is_straddle_candidate == True). Per gli altri le colonne ranking
     sono NaN.
 
@@ -436,7 +563,7 @@ def compute_borda_ranking(df: pd.DataFrame) -> pd.DataFrame:
     if cand.empty:
         return out
 
-    # Rank ascending: valore più basso → rank 1
+    # Rank ascending: valore piu' basso → rank 1
     # method="min" gestisce i pareggi in modo deterministico
     cand["rank_rv_pct"] = cand["rv_percentile"].rank(
         method="min", ascending=True, na_option="bottom"
@@ -448,7 +575,7 @@ def compute_borda_ranking(df: pd.DataFrame) -> pd.DataFrame:
         method="min", ascending=True, na_option="bottom"
     )
 
-    # Borda score = somma dei rank (più basso = meglio)
+    # Borda score = somma dei rank (piu' basso = meglio)
     cand["borda_score"] = (
         cand["rank_rv_pct"].fillna(len(cand))
         + cand["rank_atr_pct"].fillna(len(cand))
@@ -479,7 +606,7 @@ def run_analysis(
 ) -> pd.DataFrame:
     """
     Analisi batch su tutti i ticker. Restituisce DataFrame ordinato per
-    rv_percentile ascending (più compressi in cima).
+    rv_percentile ascending (piu' compressi in cima).
 
     Aggiunge ranking Borda per candidati Long Straddle.
     Logga conteggio dettagliato dei fallimenti per diagnosi.
@@ -546,12 +673,26 @@ def run_analysis(
     n_comp = int((df_out["rv_percentile"] <= COMPRESSION_THRESHOLD).sum())
     logger.info(f"COMPRESSION ZONE (≤{COMPRESSION_THRESHOLD}° pct): {n_comp} ticker")
 
+    # ── Deal-pending diagnostics ──────────────────────────────────────────────
+    if "is_deal_pending" in df_out.columns:
+        n_deal = int((df_out["is_deal_pending"] == True).sum())
+        if n_deal > 0:
+            deal_tickers = df_out.loc[
+                df_out["is_deal_pending"] == True, "ticker"
+            ].tolist()
+            logger.info(
+                f"DEAL-PENDING rilevati: {n_deal} ticker → "
+                f"{', '.join(deal_tickers[:20])}"
+                + (" ..." if n_deal > 20 else "")
+            )
+
     # ── Borda ranking sui candidati straddle ──────────────────────────────────
     df_out = compute_borda_ranking(df_out)
 
     n_cand = int((df_out["is_straddle_candidate"] == True).sum())
     logger.info(
-        f"STRADDLE CANDIDATES (gate: pct≤{STRADDLE_GATE_PCT} & rv_20<rv_60): "
+        f"STRADDLE CANDIDATES "
+        f"(gate: pct≤{STRADDLE_GATE_PCT} & rv_20<rv_60 & NOT deal_pending): "
         f"{n_cand} ticker"
     )
 
