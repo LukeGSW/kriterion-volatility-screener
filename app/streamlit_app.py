@@ -1093,23 +1093,24 @@ def main() -> None:
         st.plotly_chart(fig2, use_container_width=True)
 
     # ── Strategy reminder box ─────────────────────────────────────────────────
+    # ── Strategy reminder box ─────────────────────────────────────────────────
     st.markdown("<hr>", unsafe_allow_html=True)
     st.markdown("""
     <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;
                 padding:1.2rem 1.5rem;font-size:0.8rem;color:#8b949e;line-height:1.9">
-        <b style="color:#f0a500;font-size:0.85rem">⚡ Regole operative Long Straddle (reference)</b><br>
+        <b style="color:#f0a500;font-size:0.85rem">⚡ Regole operative Long Straddle (Mega CAP Short-Term)</b><br>
         <b style="color:#e6edf3">Entry:</b>
-            Acquisto Call + Put ATM, stessa scadenza, DTE ≈ 70–90 giorni.<br>
-        <b style="color:#e6edf3">Time Stop:</b>
-            Chiusura tassativa a DTE residui = 30 (max permanenza ~60 gg).<br>
-        <b style="color:#f0c040">Event Risk Rule:</b>
-            Chiusura il giorno precedente agli Earnings — incassa Vega run-up, evita IV Crush.<br>
-        <b style="color:#3fb950">Profit Target dinamico — guidato da Expansion Tier:</b><br>
-        &nbsp;&nbsp;• <span style="color:#f0c040">LOW</span> (ratio 2.0–3.0): target <b>+50%</b> sul premio<br>
-        &nbsp;&nbsp;• <span style="color:#a8c880">MEDIUM</span> (ratio 3.0–4.5): target <b>+100%</b> sul premio<br>
-        &nbsp;&nbsp;• <span style="color:#3fb950">HIGH</span> (ratio ≥4.5): target <b>+200%</b> sul premio<br>
-        &nbsp;&nbsp;• <span style="color:#f85149">INSUFFICIENT</span> (ratio &lt;2.0): setup strutturalmente debole — evitare.<br>
-        <b style="color:#f85149">No hard stop loss</b> basato su percentuale di perdita o livello di prezzo.
+            Acquisto Call + Put ATM, stessa scadenza, DTE ≈ 21–45 giorni per sfruttare la massima reattività del Gamma di breve periodo.<br>
+        <b style="color:#e6edf3">Time Stop (Muro del Theta):</b>
+            Chiusura tassativa a DTE residui = 15. Massima permanenza a mercato consigliata di 10–12 giorni per evitare l'accelerazione letale del decadimento temporale.<br>
+        <b style="color:#f0c040">Event Risk / Catalyst Play:</b>
+            Se aperto prima dei bilanci, chiusura il giorno precedente agli Earnings per incassare il Vega Run-up (aumento della volatilità implicita) ed evitare l'IV Crush post-annuncio.<br>
+        <b style="color:#3fb950">Profit Target dinamico calibrato su Mega Cap (Guidato da Expansion Tier):</b><br>
+        &nbsp;&nbsp;• <span style="color:#f0c040">LOW</span> (ratio 1.5–2.0): target <b>+25%</b> sul premio raccolto<br>
+        &nbsp;&nbsp;• <span style="color:#a8c880">MEDIUM</span> (ratio 2.0–3.0): target <b>+50%</b> sul premio raccolto<br>
+        &nbsp;&nbsp;• <span style="color:#3fb950">HIGH</span> (ratio ≥3.0): target <b>+80%</b> sul premio raccolto (Home Run)<br>
+        &nbsp;&nbsp;• <span style="color:#f85149">INSUFFICIENT</span> (ratio &lt;1.5): potenziale di espansione strutturalmente debole — evitare l'ingresso.<br>
+        <b style="color:#f85149">No hard stop loss</b> basato sui movimenti del sottostante. Gestione del rischio affidata esclusivamente alla duration ridotta e al Time Stop.
     </div>
     """, unsafe_allow_html=True)
 
