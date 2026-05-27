@@ -278,7 +278,9 @@ def _load_data() -> tuple[pd.DataFrame, dict]:
                 "atr_pct", "atr_pct_percentile",
                 "expansion_ratio",
                 "borda_score", "borda_rank",
-                "rank_rv_pct", "rank_atr_pct", "rank_term_structure"]:
+                "rank_rv_pct", "rank_atr_pct", "rank_term_structure",
+                # deal-pending
+                "cv_30", "range_rel_20", "volume_spike_180"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -294,6 +296,9 @@ def _load_data() -> tuple[pd.DataFrame, dict]:
 
     if "is_straddle_candidate" in df.columns:
         df["is_straddle_candidate"] = df["is_straddle_candidate"].astype(bool)
+
+    if "is_deal_pending" in df.columns:
+        df["is_deal_pending"] = df["is_deal_pending"].astype(bool)
 
     return df, metadata
 
@@ -344,6 +349,12 @@ def main() -> None:
             not df.empty and "is_straddle_candidate" in df.columns
         ) else 0,
     )
+    n_deal       = meta.get(
+        "tickers_deal_pending",
+        int(df["is_deal_pending"].sum()) if (
+            not df.empty and "is_deal_pending" in df.columns
+        ) else 0,
+    )
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
@@ -365,10 +376,14 @@ def main() -> None:
             <div class="kq-card-label">⚡ Compressi ≤5° Pct</div>
         </div>""", unsafe_allow_html=True)
     with c4:
+        # Combina Straddle Candidates + Deal-Pending esclusi nella stessa card
         st.markdown(f"""
         <div class="kq-card">
             <div class="kq-card-value">{n_straddle}</div>
             <div class="kq-card-label">🎯 Straddle Candidates</div>
+            <div style="font-size:0.7rem;color:#f85149;margin-top:0.35rem">
+                🔒 {n_deal} deal-pending esclusi
+            </div>
         </div>""", unsafe_allow_html=True)
     with c5:
         st.markdown(f"""
@@ -446,8 +461,23 @@ def main() -> None:
             value=False,
             help=(
                 "Applica il gate: RV percentile ≤ 20 AND rv_20 < rv_60 "
-                "(term structure inversa). I candidati sono ordinati per "
-                "Borda rank crescente."
+                "(term structure inversa) AND NOT deal-pending. "
+                "I candidati sono ordinati per Borda rank crescente."
+            ),
+        )
+
+        has_deal = (
+            "is_deal_pending" in df.columns
+            and df["is_deal_pending"].any()
+        )
+        exclude_deal_pending = st.toggle(
+            "🔒 Escludi Deal-Pending",
+            value=True,
+            help=(
+                "Esclude i titoli oggetto di acquisizione con prezzo definito. "
+                "Detector statistico: CV close < 0.5% AND range relativo < 0.8% "
+                "AND volume spike > 5x. Questi titoli sono vol-dead per natura "
+                "e sono i peggiori candidati per uno straddle."
             ),
         )
 
@@ -512,6 +542,9 @@ def main() -> None:
         atr_w    = meta.get("atr_window", 14)
         atr_lb   = meta.get("atr_percentile_lookback", 252)
         gate_pct = meta.get("straddle_gate_pct", 20.0)
+        deal_cv  = meta.get("deal_cv_threshold", 0.005)
+        deal_rng = meta.get("deal_range_threshold", 0.008)
+        deal_vs  = meta.get("deal_volume_spike_threshold", 5.0)
         st.markdown(f"""
         <div style="font-size:0.75rem;color:#8b949e;line-height:1.8">
             <b style="color:#e6edf3">Parametri run:</b><br>
@@ -520,7 +553,11 @@ def main() -> None:
             ATR: <b style="color:#f0a500">{atr_w}d, lookback {atr_lb}d (1y)</b><br>
             Gate Straddle: <b style="color:#f0a500">≤{gate_pct:.0f}° pct + rv₂₀&lt;rv₆₀</b><br>
             Soglia compressione: <b style="color:#f0a500">≤5° pct</b><br>
-            ADV minimo: <b style="color:#f0a500">1.5M share</b>
+            ADV minimo: <b style="color:#f0a500">1.5M share</b><br>
+            <b style="color:#e6edf3">Deal-Pending detector:</b><br>
+            CV close 30d: <b style="color:#f85149">&lt; {deal_cv*100:.2f}%</b><br>
+            Range rel 20d: <b style="color:#f85149">&lt; {deal_rng*100:.2f}%</b><br>
+            Vol spike 180d: <b style="color:#f85149">&gt; {deal_vs:.1f}x</b>
         </div>
         """, unsafe_allow_html=True)
 
@@ -544,6 +581,10 @@ def main() -> None:
     # ── Filtri Long Straddle (nuovi) ──────────────────────────────────────────
     if show_only_straddle and "is_straddle_candidate" in filt.columns:
         filt = filt[filt["is_straddle_candidate"] == True]
+
+    # Esclusione deal-pending (default attivo)
+    if exclude_deal_pending and "is_deal_pending" in filt.columns:
+        filt = filt[filt["is_deal_pending"] != True]
 
     if has_atr and max_atr_pct < 100:
         # Tiene anche i NaN, l'utente vede comunque il ticker (con tier N/A)
@@ -657,6 +698,25 @@ def main() -> None:
         if "adv_90d" in filt.columns:
             disp["ADV 90d"] = filt["adv_90d"].apply(_fmt_vol)
 
+        # Deal-pending diagnostica
+        if "is_deal_pending" in filt.columns:
+            disp["🔒 Deal"] = filt["is_deal_pending"].apply(
+                lambda x: "⚠️" if bool(x) else ""
+            )
+
+        if "cv_30" in filt.columns:
+            disp["CV 30d"] = filt["cv_30"].apply(
+                lambda x: f"{x * 100:.2f}%" if pd.notna(x) else "—"
+            )
+
+        if "range_rel_20" in filt.columns:
+            disp["Range Rel"] = filt["range_rel_20"].apply(
+                lambda x: f"{x * 100:.2f}%" if pd.notna(x) else "—"
+            )
+
+        if "volume_spike_180" in filt.columns:
+            disp["Vol Spike"] = filt["volume_spike_180"]
+
         # Days to earnings — numerico per column_config
         if "days_to_earnings" in filt.columns:
             disp["Days to Earn."] = filt["days_to_earnings"]
@@ -742,6 +802,45 @@ def main() -> None:
                 "Days to Earn.",
                 format="%d",
                 help="Giorni calendario alla prossima trimestrale (Event Risk Rule: chiudi prima degli earnings)",
+            )
+
+        if "🔒 Deal" in disp.columns:
+            col_config["🔒 Deal"] = st.column_config.TextColumn(
+                "🔒 Deal",
+                help=(
+                    "⚠️ = titolo flaggato dal detector deal-pending. "
+                    "Probabile target di acquisizione con prezzo definito — "
+                    "evitare per straddle."
+                ),
+            )
+
+        if "CV 30d" in disp.columns:
+            col_config["CV 30d"] = st.column_config.TextColumn(
+                "CV 30d",
+                help=(
+                    "Coefficient of Variation del close su 30gg. "
+                    "Valori < 0.5% indicano price pinning estremo."
+                ),
+            )
+
+        if "Range Rel" in disp.columns:
+            col_config["Range Rel"] = st.column_config.TextColumn(
+                "Range Rel",
+                help=(
+                    "Range relativo medio (H-L)/Close su 20gg. "
+                    "Valori < 0.8% indicano range giornaliero collassato."
+                ),
+            )
+
+        if "Vol Spike" in disp.columns:
+            col_config["Vol Spike"] = st.column_config.NumberColumn(
+                "Vol Spike",
+                format="%.1fx",
+                help=(
+                    "Volume spike su 180gg: max(volume) / median(volume). "
+                    "Valori > 5x indicano un evento storico (tipicamente "
+                    "annuncio di un deal)."
+                ),
             )
 
         st.dataframe(
@@ -848,11 +947,12 @@ def main() -> None:
         for row_df in rows:
             cols = st.columns(N_COLS)
             for col_idx, (_, row) in enumerate(row_df.iterrows()):
-                ticker  = row.get("ticker", "")
-                rv_val  = row.get("rv_current")
-                pct_val = row.get("rv_percentile")
-                dte     = row.get("days_to_earnings")
-                earn_dt = row.get("next_earnings_date")
+                ticker   = row.get("ticker", "")
+                rv_val   = row.get("rv_current")
+                pct_val  = row.get("rv_percentile")
+                dte      = row.get("days_to_earnings")
+                earn_dt  = row.get("next_earnings_date")
+                deal_flg = bool(row.get("is_deal_pending", False))
 
                 rv_str  = f"{rv_val:.1f}% RV" if pd.notna(rv_val) else "RV N/A"
                 pct_str = f"{pct_val:.1f}° pct" if pd.notna(pct_val) else "—"
@@ -863,6 +963,11 @@ def main() -> None:
                     "Earnings: N/A"
                 )
                 ec = _earn_color(dte if pd.notna(dte) else None)
+                deal_badge = (
+                    '<div style="font-size:0.7rem;color:#f85149;font-weight:600;'
+                    'margin-top:0.3rem;letter-spacing:0.05em">🔒 DEAL-PENDING</div>'
+                    if deal_flg else ""
+                )
 
                 with cols[col_idx]:
                     st.markdown(f"""
@@ -870,6 +975,7 @@ def main() -> None:
                         <div class="kq-ticker-name">{ticker}</div>
                         <div class="kq-ticker-rv">{rv_str}</div>
                         <div class="kq-ticker-pct">{pct_str}</div>
+                        {deal_badge}
                         <div class="kq-ticker-earn" style="color:{ec}">
                             {dte_str}
                         </div>
