@@ -53,7 +53,7 @@ from quant_engine import (
 )
 
 # ── Configurazione ─────────────────────────────────────────────────────────────
-MIN_MARKET_CAP: float  = 2_000_000_000   # $2 miliardi
+MIN_MARKET_CAP: float  = 100_000_000_000   # $100 miliardi
 HISTORY_YEARS: int     = 3               # Anni di storia OHLCV
 # Buffer generoso: 365 giorni calendario ≈ 260 trading days extra.
 # Garantisce 756+90 = 846 trading days anche con gap e dati mancanti.
