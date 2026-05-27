@@ -486,3 +486,157 @@ class EODHDClient:
         found = sum(1 for v in earnings_map.values() if v is not None)
         logger.info("Earnings trovate: %d/%d ticker", found, len(tickers))
         return earnings_map
+
+    # -- News API: blacklist M&A (deal-pending exclusion) ---------------------
+    def get_ma_news_tickers(
+        self,
+        days_lookback: int   = 180,
+        min_mentions: int    = 2,
+        market_suffix: str   = ".US",
+        page_limit: int      = 1000,
+        max_pages: int       = 30,
+    ) -> Dict[str, int]:
+        """
+        Recupera la blacklist dei ticker oggetto di M&A negli ultimi N giorni
+        usando il News API EODHD con tag 'MERGERS AND ACQUISITIONS'.
+
+        Logica:
+          1. Paginazione di /api/news?t=MERGERS+AND+ACQUISITIONS&from=...&to=...
+          2. Aggregazione del campo `symbols` di ogni articolo
+          3. Filtro per market_suffix (default '.US' per coerenza con l'universo)
+          4. Conteggio occorrenze: ogni ticker e' contato 1 volta per articolo distinto
+          5. Restituisce solo i ticker con conteggio >= min_mentions
+
+        Parameters
+        ----------
+        days_lookback : int
+            Finestra temporale (giorni indietro da oggi) per cercare news M&A.
+        min_mentions : int
+            Soglia minima di articoli distinti per includere un ticker.
+            min_mentions=2 filtra speculazioni isolate / rumor non confermati.
+        market_suffix : str
+            Suffisso EODHD per filtrare il market (es. '.US', '.LSE').
+            Stringa vuota disabilita il filtro.
+        page_limit : int
+            Articoli per pagina (max 1000 da spec EODHD).
+        max_pages : int
+            Safety cap sulla paginazione. Con 1000/pagina e ~10000 articoli
+            attesi su 180gg, 30 pagine sono un margine ampio.
+
+        Returns
+        -------
+        dict {ticker_base: n_mentions} per ticker con n >= min_mentions.
+        Il ticker e' restituito SENZA suffisso (es. 'AAPL', non 'AAPL.US')
+        per facilitare il matching con l'universo.
+
+        Raises
+        ------
+        EODHDError se la chiamata API fallisce (no fallback).
+        """
+        today    = datetime.utcnow().date()
+        from_dt  = today - timedelta(days=days_lookback)
+
+        url = "{}/news".format(BASE_URL)
+        ticker_counts: Dict[str, int] = {}
+        total_articles = 0
+        offset         = 0
+        page_idx       = 0
+
+        logger.info(
+            "News M&A: fetch %s -> %s (lookback %dgg, min_mentions=%d, market='%s')",
+            from_dt.isoformat(), today.isoformat(),
+            days_lookback, min_mentions, market_suffix,
+        )
+
+        while page_idx < max_pages:
+            params = {
+                "api_token": self.api_token,
+                "fmt":       "json",
+                "t":         "MERGERS AND ACQUISITIONS",
+                "from":      from_dt.isoformat(),
+                "to":        today.isoformat(),
+                "limit":     page_limit,
+                "offset":    offset,
+            }
+            data = _get_json(url, params)  # raise EODHDError on failure
+
+            if not isinstance(data, list):
+                logger.warning(
+                    "News API: response non-list a pagina %d (offset %d). "
+                    "Tipo: %s. Interrompo paginazione.",
+                    page_idx + 1, offset, type(data).__name__,
+                )
+                break
+
+            n_returned = len(data)
+            if n_returned == 0:
+                logger.info("News M&A: nessun articolo a offset %d, fine paginazione.", offset)
+                break
+
+            total_articles += n_returned
+
+            # Aggrega ticker per articolo. Set per articolo per evitare
+            # doppi conteggi quando un ticker appare piu' volte nello stesso articolo.
+            for article in data:
+                if not isinstance(article, dict):
+                    continue
+                symbols = article.get("symbols") or []
+                if not isinstance(symbols, list):
+                    continue
+                # Set per articolo: ogni ticker conta 1 volta per articolo
+                article_tickers = set()
+                for sym in symbols:
+                    if not isinstance(sym, str):
+                        continue
+                    sym = sym.strip()
+                    # Filtro market suffix
+                    if market_suffix and not sym.endswith(market_suffix):
+                        continue
+                    # Estrai ticker base (senza suffisso)
+                    base = sym[:-len(market_suffix)] if market_suffix else sym
+                    base = base.upper()
+                    if base:
+                        article_tickers.add(base)
+                for t in article_tickers:
+                    ticker_counts[t] = ticker_counts.get(t, 0) + 1
+
+            logger.info(
+                "News M&A: pagina %d (offset %d): %d articoli ricevuti, "
+                "totale articoli=%d, ticker unici fino ad ora=%d",
+                page_idx + 1, offset, n_returned, total_articles, len(ticker_counts),
+            )
+
+            # Se la pagina e' incompleta, abbiamo finito
+            if n_returned < page_limit:
+                break
+
+            offset   += page_limit
+            page_idx += 1
+            time.sleep(0.2)  # cortesia verso l'API
+
+        if page_idx >= max_pages:
+            logger.warning(
+                "News M&A: max_pages=%d raggiunto. "
+                "Articoli scansionati=%d (potrebbero esserci ulteriori articoli non visti).",
+                max_pages, total_articles,
+            )
+
+        # Filtro per soglia minima
+        blacklist = {t: n for t, n in ticker_counts.items() if n >= min_mentions}
+
+        logger.info(
+            "News M&A: fetch completato. "
+            "Articoli totali=%d, ticker unici menzionati=%d, "
+            "blacklist finale (n>=%d)=%d ticker",
+            total_articles, len(ticker_counts), min_mentions, len(blacklist),
+        )
+
+        if blacklist:
+            # Log dei top 20 per maggior conteggio (i piu' "caldi")
+            top = sorted(blacklist.items(), key=lambda kv: -kv[1])[:20]
+            logger.info(
+                "Top blacklist (ticker, n_mentions): %s",
+                ", ".join("{}={}".format(t, n) for t, n in top),
+            )
+
+        return blacklist
