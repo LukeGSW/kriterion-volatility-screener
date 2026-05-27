@@ -40,12 +40,6 @@ from quant_engine import (
     ATR_PERCENTILE_LOOKBACK,
     ATR_WINDOW,
     COMPRESSION_THRESHOLD,
-    DEAL_CV_THRESHOLD,
-    DEAL_CV_WINDOW,
-    DEAL_RANGE_THRESHOLD,
-    DEAL_RANGE_WINDOW,
-    DEAL_VOLUME_SPIKE_THRESHOLD,
-    DEAL_VOLUME_WINDOW,
     EXPANSION_TIER_HIGH,
     EXPANSION_TIER_LOW,
     EXPANSION_TIER_MEDIUM,
@@ -65,6 +59,13 @@ HISTORY_YEARS: int     = 3               # Anni di storia OHLCV
 # Garantisce 756+90 = 846 trading days anche con gap e dati mancanti.
 HISTORY_BUFFER_DAYS: int = 365
 EARNINGS_DAYS_AHEAD: int = 90
+
+# ── Deal-Pending (News M&A blacklist) ─────────────────────────────────────────
+# Configurazione fetch del News API EODHD con tag MERGERS AND ACQUISITIONS.
+# I ticker che appaiono in >= MA_NEWS_MIN_MENTIONS articoli distinti negli
+# ultimi MA_NEWS_LOOKBACK_DAYS sono esclusi dai candidati Long Straddle.
+MA_NEWS_LOOKBACK_DAYS: int = 180   # finestra news
+MA_NEWS_MIN_MENTIONS: int  = 2     # soglia articoli distinti per blacklist
 
 DATA_DIR: Path        = _REPO_ROOT / "data"
 OUTPUT_PARQUET: Path  = DATA_DIR / "screener_results.parquet"
@@ -206,6 +207,25 @@ def run_pipeline() -> None:
     n_with_data = sum(1 for d in ohlcv_data.values() if not d.empty)
     logger.info(f"OHLCV ricevuti: {n_with_data}/{n_universe} ticker con dati")
 
+    # ── Step 3b: Blacklist M&A via News API ──────────────────────────────────
+    # Una sola chiamata batch al News API per identificare ticker oggetto di
+    # acquisizione negli ultimi MA_NEWS_LOOKBACK_DAYS giorni. NO fallback:
+    # se la API fallisce, il pipeline si interrompe (EODHDError propagata).
+    logger.info(
+        f"[3b/7] News M&A: fetch blacklist "
+        f"({MA_NEWS_LOOKBACK_DAYS}gg lookback, min {MA_NEWS_MIN_MENTIONS} menzioni)..."
+    )
+    deal_pending_counts = client.get_ma_news_tickers(
+        days_lookback=MA_NEWS_LOOKBACK_DAYS,
+        min_mentions=MA_NEWS_MIN_MENTIONS,
+        market_suffix=".US",
+    )
+    deal_pending_set = set(deal_pending_counts.keys())
+    logger.info(
+        f"Blacklist M&A: {len(deal_pending_set)} ticker "
+        f"(esclusi dai candidati Straddle)"
+    )
+
     # ── Step 4-5: Analisi quantitativa ───────────────────────────────────────
     logger.info(
         f"[4-5/7] Analisi quantitativa "
@@ -216,6 +236,7 @@ def run_pipeline() -> None:
         ohlcv_data=ohlcv_data,
         rv_window=RV_WINDOW,
         percentile_lookback=PERCENTILE_LOOKBACK,
+        deal_pending_set=deal_pending_set,
     )
 
     # ── Step 6a: Metadati universo ────────────────────────────────────────────
@@ -260,11 +281,9 @@ def run_pipeline() -> None:
             "atr_pct", "atr_pct_percentile",
             # Expansion
             "expansion_ratio", "expansion_tier",
-            # Deal-pending detector
-            "cv_30", "range_rel_20", "volume_spike_180", "is_deal_pending",
             # Volume / prezzo / flags
             "adv_30d", "adv_90d", "close_price", "last_date",
-            "is_compressed", "is_straddle_candidate",
+            "is_compressed", "is_deal_pending", "is_straddle_candidate",
             # Ranking Borda
             "rank_rv_pct", "rank_atr_pct", "rank_term_structure",
             "borda_score", "borda_rank",
@@ -308,13 +327,10 @@ def run_pipeline() -> None:
         "expansion_tier_low":         EXPANSION_TIER_LOW,
         "expansion_tier_medium":      EXPANSION_TIER_MEDIUM,
         "expansion_tier_high":        EXPANSION_TIER_HIGH,
-        # Deal-pending detector
-        "deal_cv_window":             DEAL_CV_WINDOW,
-        "deal_range_window":          DEAL_RANGE_WINDOW,
-        "deal_volume_window":         DEAL_VOLUME_WINDOW,
-        "deal_cv_threshold":          DEAL_CV_THRESHOLD,
-        "deal_range_threshold":       DEAL_RANGE_THRESHOLD,
-        "deal_volume_spike_threshold": DEAL_VOLUME_SPIKE_THRESHOLD,
+        # News M&A blacklist
+        "ma_news_lookback_days":      MA_NEWS_LOOKBACK_DAYS,
+        "ma_news_min_mentions":       MA_NEWS_MIN_MENTIONS,
+        "ma_news_blacklist_size":     len(deal_pending_set),
         # Universo / volume
         "min_market_cap":             MIN_MARKET_CAP,
         "min_adv":                    MIN_ADV,
