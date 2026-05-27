@@ -278,7 +278,9 @@ def _load_data() -> tuple[pd.DataFrame, dict]:
                 "atr_pct", "atr_pct_percentile",
                 "expansion_ratio",
                 "borda_score", "borda_rank",
-                "rank_rv_pct", "rank_atr_pct", "rank_term_structure"]:
+                "rank_rv_pct", "rank_atr_pct", "rank_term_structure",
+                # MNA ETF weight
+                "mna_etf_weight"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -472,11 +474,12 @@ def main() -> None:
             "🔒 Escludi Deal-Pending",
             value=True,
             help=(
-                "Esclude i titoli oggetto di acquisizione (target o acquirer). "
-                "Blacklist popolata dal News API EODHD con tag "
-                "MERGERS AND ACQUISITIONS (lookback 180gg, soglia 2 menzioni). "
-                "Questi titoli sono vol-dead per natura e sono i peggiori "
-                "candidati per uno straddle."
+                "Esclude i titoli target di acquisizione. "
+                "Blacklist popolata dalle holdings del NYLI Merger Arbitrage "
+                "ETF (MNA), un ETF curato da NYLI che mantiene posizioni LONG "
+                "sui target di takeover annunciati globalmente. "
+                "Questi titoli sono vol-dead per natura (price pinning verso "
+                "il deal price) e sono i peggiori candidati per uno straddle."
             ),
         )
 
@@ -541,9 +544,8 @@ def main() -> None:
         atr_w    = meta.get("atr_window", 14)
         atr_lb   = meta.get("atr_percentile_lookback", 252)
         gate_pct = meta.get("straddle_gate_pct", 20.0)
-        news_lb  = meta.get("ma_news_lookback_days", 180)
-        news_mm  = meta.get("ma_news_min_mentions", 2)
-        news_bl  = meta.get("ma_news_blacklist_size", 0)
+        mna_date = meta.get("mna_etf_holdings_date", "n/a")
+        mna_bl   = meta.get("mna_etf_blacklist_size", 0)
         st.markdown(f"""
         <div style="font-size:0.75rem;color:#8b949e;line-height:1.8">
             <b style="color:#e6edf3">Parametri run:</b><br>
@@ -553,10 +555,10 @@ def main() -> None:
             Gate Straddle: <b style="color:#f0a500">≤{gate_pct:.0f}° pct + rv₂₀&lt;rv₆₀</b><br>
             Soglia compressione: <b style="color:#f0a500">≤5° pct</b><br>
             ADV minimo: <b style="color:#f0a500">1.5M share</b><br>
-            <b style="color:#e6edf3">Deal-Pending (News M&A):</b><br>
-            News lookback: <b style="color:#f85149">{news_lb} giorni</b><br>
-            Min menzioni: <b style="color:#f85149">{news_mm} articoli</b><br>
-            Blacklist size: <b style="color:#f85149">{news_bl} ticker</b>
+            <b style="color:#e6edf3">Deal-Pending (NYLI MNA ETF):</b><br>
+            Fonte: <b style="color:#f85149">NYLI Merger Arb ETF</b><br>
+            Holdings date: <b style="color:#f85149">{mna_date}</b><br>
+            Blacklist size: <b style="color:#f85149">{mna_bl} ticker</b>
         </div>
         """, unsafe_allow_html=True)
 
@@ -697,11 +699,15 @@ def main() -> None:
         if "adv_90d" in filt.columns:
             disp["ADV 90d"] = filt["adv_90d"].apply(_fmt_vol)
 
-        # Deal-pending flag (popolato da News API M&A)
+        # Deal-pending flag (popolato da NYLI MNA ETF holdings)
         if "is_deal_pending" in filt.columns:
             disp["🔒 Deal"] = filt["is_deal_pending"].apply(
                 lambda x: "⚠️" if bool(x) else ""
             )
+
+        # MNA ETF weight (peso del ticker nell'ETF, proxy confidence del deal)
+        if "mna_etf_weight" in filt.columns:
+            disp["MNA Weight"] = filt["mna_etf_weight"]
 
         # Days to earnings — numerico per column_config
         if "days_to_earnings" in filt.columns:
@@ -795,10 +801,20 @@ def main() -> None:
                 "🔒 Deal",
                 help=(
                     "⚠️ = ticker in blacklist Deal-Pending. "
-                    "Popolata dal News API EODHD (tag MERGERS AND ACQUISITIONS, "
-                    "lookback 180gg, soglia 2 menzioni). "
-                    "Probabile target o acquirer di un deal in corso — "
-                    "evitare per straddle."
+                    "Popolata dalle holdings del NYLI Merger Arbitrage ETF (MNA). "
+                    "Target di takeover annunciato — vol-dead per natura."
+                ),
+            )
+
+        if "MNA Weight" in disp.columns:
+            col_config["MNA Weight"] = st.column_config.NumberColumn(
+                "MNA Weight",
+                format="%.2f%%",
+                help=(
+                    "Peso del ticker nell'ETF NYLI Merger Arbitrage. "
+                    "Proxy della confidence del market nella chiusura del deal: "
+                    "peso alto (>3%) = spread basso = alta probabilita' di chiusura. "
+                    "Valore vuoto = ticker non nell'ETF MNA."
                 ),
             )
 
