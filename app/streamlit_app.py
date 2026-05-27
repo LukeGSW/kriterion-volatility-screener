@@ -490,9 +490,9 @@ def main() -> None:
         if has_atr:
             max_atr_pct = st.slider(
                 "ATR Percentile massimo",
-                min_value=1, max_value=100, value=25, step=5,
+                min_value=1, max_value=100, value=100, step=5,
                 help=(
-                    "ATR(14)/Close percentile su 252gg. "
+                    "ATR(5)/Close percentile su 126gg (6 mesi). "
                     "Valori bassi indicano range giornaliero compresso. "
                     "Imposta 100 per disattivare il filtro."
                 ),
@@ -506,10 +506,10 @@ def main() -> None:
         )
         if has_term:
             max_term_structure = st.slider(
-                "Term Structure max (rv_20/rv_60)",
+                "Term Structure max (rv_5/rv_14)",
                 min_value=0.50, max_value=1.50, value=1.50, step=0.05,
                 help=(
-                    "Rapporto RV breve / RV intermedia. "
+                    "Rapporto RV breve (5d) / RV intermedia (14d). "
                     "< 1.0 = squeeze attivo. < 0.7 = squeeze acuto. "
                     "Imposta 1.50 per disattivare il filtro."
                 ),
@@ -655,12 +655,12 @@ def main() -> None:
 
         # Nuove metriche multi-window
         if "rv_20" in filt.columns:
-            disp["RV 20d (%)"] = filt["rv_20"].apply(
+            disp["RV 5d (%)"] = filt["rv_20"].apply(
                 lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
             )
 
         if "rv_60" in filt.columns:
-            disp["RV 60d (%)"] = filt["rv_60"].apply(
+            disp["RV 14d (%)"] = filt["rv_60"].apply(
                 lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
             )
 
@@ -674,7 +674,7 @@ def main() -> None:
             )
 
         if "atr_pct_percentile" in filt.columns:
-            disp["ATR Pct (1y)"] = filt["atr_pct_percentile"]
+            disp["ATR Pct (6m)"] = filt["atr_pct_percentile"]
 
         # Expansion
         if "expansion_ratio" in filt.columns:
@@ -758,16 +758,16 @@ def main() -> None:
                 "Term Struct",
                 format="%.2f",
                 help=(
-                    "rv_20 / rv_60. < 1.0 = compressione attiva, "
+                    "rv_5 / rv_14. < 1.0 = compressione attiva, "
                     "< 0.7 = squeeze acuto."
                 ),
             )
 
-        if "ATR Pct (1y)" in disp.columns:
-            col_config["ATR Pct (1y)"] = st.column_config.NumberColumn(
-                "ATR Pct (1y)",
+        if "ATR Pct (6m)" in disp.columns:
+            col_config["ATR Pct (6m)"] = st.column_config.NumberColumn(
+                "ATR Pct (6m)",
                 format="%.1f",
-                help="ATR(14)/Close percentile su lookback 252gg.",
+                help="ATR(5)/Close percentile su lookback 126gg (6 mesi).",
             )
 
         if "Exp. Ratio" in disp.columns:
@@ -990,17 +990,12 @@ def main() -> None:
                 hovertemplate="Pct: %{x:.0f} | Count: %{y}<extra></extra>",
             ))
 
+        # Evidenzia la nuova zona operativa (10° Pct)
         fig.add_vline(
-            x=5, line_dash="dash", line_color="#f85149", line_width=1.5,
-            annotation_text="5° Pct — Compression Zone",
+            x=10, line_dash="dash", line_color="#f85149", line_width=1.5,
+            annotation_text="10° Pct — Compression Zone",
             annotation_font_color="#f85149",
             annotation_font_size=11,
-        )
-        fig.add_vline(
-            x=10, line_dash="dot", line_color="#f0c040", line_width=1.2,
-            annotation_text="10° Pct",
-            annotation_font_color="#f0c040",
-            annotation_font_size=10,
         )
 
         fig.update_layout(
@@ -1009,7 +1004,7 @@ def main() -> None:
             plot_bgcolor="#161b22",
             font=dict(color="#e6edf3", size=12),
             xaxis=dict(
-                title="RV Percentile Rolling (3 anni)",
+                title="RV Percentile Rolling (1 anno)",
                 gridcolor="#21262d",
                 range=[0, 100],
             ),
@@ -1063,13 +1058,13 @@ def main() -> None:
             hovertemplate=(
                 "<b>%{text}</b><br>"
                 "Percentile: %{x:.1f}<br>"
-                "RV 90d: %{y:.1f}%<extra></extra>"
+                "RV 14d: %{y:.1f}%<extra></extra>"
             ),
         ))
 
-        # Linea verticale zona compressione
+        # Linea verticale zona compressione aggiornata al 10° pct
         fig2.add_vline(
-            x=5, line_dash="dash", line_color="#f85149", line_width=1.5,
+            x=10, line_dash="dash", line_color="#f85149", line_width=1.5,
         )
 
         fig2.update_layout(
@@ -1078,12 +1073,12 @@ def main() -> None:
             plot_bgcolor="#161b22",
             font=dict(color="#e6edf3", size=12),
             xaxis=dict(
-                title="RV Percentile (3y)",
+                title="RV Percentile (1y)",
                 gridcolor="#21262d",
                 range=[0, 100],
             ),
             yaxis=dict(
-                title="RV 90d (%)",
+                title="RV 14d (%)",
                 gridcolor="#21262d",
             ),
             height=350,
