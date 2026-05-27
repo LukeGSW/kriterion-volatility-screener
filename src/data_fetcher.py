@@ -15,6 +15,7 @@ No options data. No hard stop logic.
 """
 
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -41,6 +42,51 @@ VALID_TYPES = {"Common Stock", "ETF"}
 
 # Pre-filtro volume sull'ultimo giorno (conservative - ADV 1.5M fara' il lavoro duro)
 MIN_VOLUME_PREFILTER = 100_000
+
+
+# ── Keyword filter per il titolo di articoli M&A ─────────────────────────────
+# Il tag MERGERS AND ACQUISITIONS di EODHD e' troppo generico (cattura anche
+# commenti di settore, dichiarazioni di CEO acquirer, advisory news, Form 8.5
+# UK Takeover Panel). Questo filtro identifica SOLO articoli che annunciano
+# o discutono un deal specifico, escludendo il rumore.
+#
+# Pattern catturati (case-insensitive):
+#   - "X to be acquired by Y" / "X to acquire Y"
+#   - "X agrees to acquire Y" / "agrees? to be acquired"
+#   - "merger agreement" / "definitive (merger) agreement"
+#   - "tender offer for X"
+#   - "X to go private" / "go-private" / "take X private"
+#   - "X to merge with Y" / "merger of equals"
+#   - "buyout" / "takeover bid"
+#   - "completes acquisition" / "closes acquisition" (deal in chiusura)
+#   - "acquires"  (passato semplice, deal annunciato)
+DEAL_TITLE_PATTERN = re.compile(
+    r"\b("
+    r"to\s+be\s+acquired\s+by|"
+    r"agrees?\s+to\s+(be\s+)?acquire|"
+    r"agrees?\s+to\s+be\s+acquired|"
+    r"(definitive\s+)?merger\s+agreement|"
+    r"tender\s+offer\s+for|"
+    # "take [obj] private" con 0-4 parole intermedie (es: 'take EA private',
+    # 'take Pioneer Natural Resources private')
+    r"take(?:\s+\S+){0,4}\s+private|"
+    r"to\s+go\s+private|"
+    r"go[\s-]private|"
+    r"take[\s-]over\b|"
+    r"merger\s+of\s+equals|"
+    r"to\s+merge\s+with|"
+    # "buyout" solo se preceduto da indicatore monetario o "completes/in/all-cash"
+    r"\$[\d\.]+\s*[a-zA-Z]?\s+buyout|"
+    r"all[\s-]cash\s+buyout|"
+    r"completes?\s+\S+\s+buyout|"
+    r"takeover\s+(bid|offer)|"
+    r"completes?\s+(the\s+)?acquisition|"
+    r"closes?\s+(the\s+)?acquisition|"
+    r"to\s+acquire\b|"
+    r"acquires?\b"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 # -- Custom exception ----------------------------------------------------------
@@ -491,21 +537,29 @@ class EODHDClient:
     def get_ma_news_tickers(
         self,
         days_lookback: int   = 180,
-        min_mentions: int    = 2,
+        min_mentions: int    = 1,
         market_suffix: str   = ".US",
         page_limit: int      = 1000,
         max_pages: int       = 30,
+        require_deal_keyword: bool = True,
     ) -> Dict[str, int]:
         """
         Recupera la blacklist dei ticker oggetto di M&A negli ultimi N giorni
-        usando il News API EODHD con tag 'MERGERS AND ACQUISITIONS'.
+        usando il News API EODHD con tag 'MERGERS AND ACQUISITIONS', filtrato
+        per keyword di "deal annunciato" nel titolo.
 
         Logica:
           1. Paginazione di /api/news?t=MERGERS+AND+ACQUISITIONS&from=...&to=...
-          2. Aggregazione del campo `symbols` di ogni articolo
-          3. Filtro per market_suffix (default '.US' per coerenza con l'universo)
-          4. Conteggio occorrenze: ogni ticker e' contato 1 volta per articolo distinto
-          5. Restituisce solo i ticker con conteggio >= min_mentions
+          2. FILTRO TITOLO: scarta articoli il cui titolo NON contiene keyword
+             di deal annunciato (DEAL_TITLE_PATTERN). Questo elimina:
+               - Form 8.5 UK disclosures
+               - Commenti di settore generici
+               - Articoli su mega-cap che fanno multiple M&A
+               - Speculazioni e rumor non confermati
+          3. Aggregazione del campo `symbols` degli articoli sopravvissuti
+          4. Filtro per market_suffix (default '.US' per coerenza con universo)
+          5. Conteggio occorrenze: ogni ticker e' contato 1 volta per articolo
+          6. Restituisce solo ticker con conteggio >= min_mentions
 
         Parameters
         ----------
@@ -513,21 +567,23 @@ class EODHDClient:
             Finestra temporale (giorni indietro da oggi) per cercare news M&A.
         min_mentions : int
             Soglia minima di articoli distinti per includere un ticker.
-            min_mentions=2 filtra speculazioni isolate / rumor non confermati.
+            Con require_deal_keyword=True bastano min_mentions=1 perche'
+            ogni articolo che passa il keyword filter e' gia' un segnale forte.
         market_suffix : str
             Suffisso EODHD per filtrare il market (es. '.US', '.LSE').
             Stringa vuota disabilita il filtro.
         page_limit : int
             Articoli per pagina (max 1000 da spec EODHD).
         max_pages : int
-            Safety cap sulla paginazione. Con 1000/pagina e ~10000 articoli
-            attesi su 180gg, 30 pagine sono un margine ampio.
+            Safety cap sulla paginazione.
+        require_deal_keyword : bool
+            Se True (default), applica DEAL_TITLE_PATTERN per filtrare i
+            titoli. Se False, conta TUTTI gli articoli del tag (comportamento
+            legacy, alto rumore).
 
         Returns
         -------
         dict {ticker_base: n_mentions} per ticker con n >= min_mentions.
-        Il ticker e' restituito SENZA suffisso (es. 'AAPL', non 'AAPL.US')
-        per facilitare il matching con l'universo.
 
         Raises
         ------
@@ -541,14 +597,20 @@ class EODHDClient:
         # Conteggio dei symbol "scartati" dal filtro market per diagnostica
         rejected_suffix_samples: Dict[str, int] = {}
         sample_articles_logged = 0
-        total_articles = 0
+        sample_matched_logged  = 0  # log dei primi titoli che matchano
+        total_articles         = 0
+        articles_kept          = 0  # articoli che passano il keyword filter
+        articles_no_keyword    = 0  # articoli scartati dal keyword filter
+        articles_no_symbols    = 0  # articoli passati ma con symbols=[]
         offset         = 0
         page_idx       = 0
 
         logger.info(
-            "News M&A: fetch %s -> %s (lookback %dgg, min_mentions=%d, market='%s')",
+            "News M&A: fetch %s -> %s (lookback %dgg, min_mentions=%d, "
+            "market='%s', keyword_filter=%s)",
             from_dt.isoformat(), today.isoformat(),
             days_lookback, min_mentions, market_suffix,
+            "ON" if require_deal_keyword else "OFF",
         )
 
         while page_idx < max_pages:
@@ -583,18 +645,40 @@ class EODHDClient:
             for article in data:
                 if not isinstance(article, dict):
                     continue
-                symbols = article.get("symbols") or []
-                if not isinstance(symbols, list):
-                    continue
 
-                # DIAGNOSTICA: log dei primi 3 articoli per verificare formato symbols
-                if sample_articles_logged < 3:
-                    title = article.get("title", "")[:80]
+                title = article.get("title", "") or ""
+
+                # ── KEYWORD FILTER sul titolo ──────────────────────────────────
+                # Se attivo, scarta articoli che non matchano DEAL_TITLE_PATTERN.
+                if require_deal_keyword:
+                    if not DEAL_TITLE_PATTERN.search(title):
+                        articles_no_keyword += 1
+                        # Log primi 2 esempi di articoli scartati per debug
+                        if sample_articles_logged < 2:
+                            logger.info(
+                                "News M&A scartato (no keyword): '%s'",
+                                title[:100],
+                            )
+                            sample_articles_logged += 1
+                        continue
+
+                articles_kept += 1
+
+                # Log dei primi 3 articoli che PASSANO il keyword filter
+                if sample_matched_logged < 3:
+                    symbols_preview = article.get("symbols") or []
                     logger.info(
-                        "News M&A sample %d: symbols=%s | title='%s'",
-                        sample_articles_logged + 1, symbols, title,
+                        "News M&A MATCHED %d: title='%s' | symbols=%s",
+                        sample_matched_logged + 1,
+                        title[:100],
+                        symbols_preview[:10],
                     )
-                    sample_articles_logged += 1
+                    sample_matched_logged += 1
+
+                symbols = article.get("symbols") or []
+                if not isinstance(symbols, list) or len(symbols) == 0:
+                    articles_no_symbols += 1
+                    continue
 
                 # Set per articolo: ogni ticker conta 1 volta per articolo
                 article_tickers = set()
@@ -650,9 +734,11 @@ class EODHDClient:
 
         logger.info(
             "News M&A: fetch completato. "
-            "Articoli totali=%d, ticker unici menzionati=%d, "
-            "blacklist finale (n>=%d)=%d ticker",
-            total_articles, len(ticker_counts), min_mentions, len(blacklist),
+            "Articoli totali=%d (kept=%d, no_keyword=%d, no_symbols=%d), "
+            "ticker unici menzionati=%d, blacklist finale (n>=%d)=%d ticker",
+            total_articles, articles_kept, articles_no_keyword,
+            articles_no_symbols, len(ticker_counts),
+            min_mentions, len(blacklist),
         )
 
         if blacklist:
