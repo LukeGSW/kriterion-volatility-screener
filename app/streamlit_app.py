@@ -278,9 +278,7 @@ def _load_data() -> tuple[pd.DataFrame, dict]:
                 "atr_pct", "atr_pct_percentile",
                 "expansion_ratio",
                 "borda_score", "borda_rank",
-                "rank_rv_pct", "rank_atr_pct", "rank_term_structure",
-                # deal-pending
-                "cv_30", "range_rel_20", "volume_spike_180"]:
+                "rank_rv_pct", "rank_atr_pct", "rank_term_structure"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -474,10 +472,11 @@ def main() -> None:
             "🔒 Escludi Deal-Pending",
             value=True,
             help=(
-                "Esclude i titoli oggetto di acquisizione con prezzo definito. "
-                "Detector statistico: CV close < 0.5% AND range relativo < 0.8% "
-                "AND volume spike > 5x. Questi titoli sono vol-dead per natura "
-                "e sono i peggiori candidati per uno straddle."
+                "Esclude i titoli oggetto di acquisizione (target o acquirer). "
+                "Blacklist popolata dal News API EODHD con tag "
+                "MERGERS AND ACQUISITIONS (lookback 180gg, soglia 2 menzioni). "
+                "Questi titoli sono vol-dead per natura e sono i peggiori "
+                "candidati per uno straddle."
             ),
         )
 
@@ -542,9 +541,9 @@ def main() -> None:
         atr_w    = meta.get("atr_window", 14)
         atr_lb   = meta.get("atr_percentile_lookback", 252)
         gate_pct = meta.get("straddle_gate_pct", 20.0)
-        deal_cv  = meta.get("deal_cv_threshold", 0.005)
-        deal_rng = meta.get("deal_range_threshold", 0.008)
-        deal_vs  = meta.get("deal_volume_spike_threshold", 5.0)
+        news_lb  = meta.get("ma_news_lookback_days", 180)
+        news_mm  = meta.get("ma_news_min_mentions", 2)
+        news_bl  = meta.get("ma_news_blacklist_size", 0)
         st.markdown(f"""
         <div style="font-size:0.75rem;color:#8b949e;line-height:1.8">
             <b style="color:#e6edf3">Parametri run:</b><br>
@@ -554,10 +553,10 @@ def main() -> None:
             Gate Straddle: <b style="color:#f0a500">≤{gate_pct:.0f}° pct + rv₂₀&lt;rv₆₀</b><br>
             Soglia compressione: <b style="color:#f0a500">≤5° pct</b><br>
             ADV minimo: <b style="color:#f0a500">1.5M share</b><br>
-            <b style="color:#e6edf3">Deal-Pending detector:</b><br>
-            CV close 30d: <b style="color:#f85149">&lt; {deal_cv*100:.2f}%</b><br>
-            Range rel 20d: <b style="color:#f85149">&lt; {deal_rng*100:.2f}%</b><br>
-            Vol spike 180d: <b style="color:#f85149">&gt; {deal_vs:.1f}x</b>
+            <b style="color:#e6edf3">Deal-Pending (News M&A):</b><br>
+            News lookback: <b style="color:#f85149">{news_lb} giorni</b><br>
+            Min menzioni: <b style="color:#f85149">{news_mm} articoli</b><br>
+            Blacklist size: <b style="color:#f85149">{news_bl} ticker</b>
         </div>
         """, unsafe_allow_html=True)
 
@@ -698,24 +697,11 @@ def main() -> None:
         if "adv_90d" in filt.columns:
             disp["ADV 90d"] = filt["adv_90d"].apply(_fmt_vol)
 
-        # Deal-pending diagnostica
+        # Deal-pending flag (popolato da News API M&A)
         if "is_deal_pending" in filt.columns:
             disp["🔒 Deal"] = filt["is_deal_pending"].apply(
                 lambda x: "⚠️" if bool(x) else ""
             )
-
-        if "cv_30" in filt.columns:
-            disp["CV 30d"] = filt["cv_30"].apply(
-                lambda x: f"{x * 100:.2f}%" if pd.notna(x) else "—"
-            )
-
-        if "range_rel_20" in filt.columns:
-            disp["Range Rel"] = filt["range_rel_20"].apply(
-                lambda x: f"{x * 100:.2f}%" if pd.notna(x) else "—"
-            )
-
-        if "volume_spike_180" in filt.columns:
-            disp["Vol Spike"] = filt["volume_spike_180"]
 
         # Days to earnings — numerico per column_config
         if "days_to_earnings" in filt.columns:
@@ -808,38 +794,11 @@ def main() -> None:
             col_config["🔒 Deal"] = st.column_config.TextColumn(
                 "🔒 Deal",
                 help=(
-                    "⚠️ = titolo flaggato dal detector deal-pending. "
-                    "Probabile target di acquisizione con prezzo definito — "
+                    "⚠️ = ticker in blacklist Deal-Pending. "
+                    "Popolata dal News API EODHD (tag MERGERS AND ACQUISITIONS, "
+                    "lookback 180gg, soglia 2 menzioni). "
+                    "Probabile target o acquirer di un deal in corso — "
                     "evitare per straddle."
-                ),
-            )
-
-        if "CV 30d" in disp.columns:
-            col_config["CV 30d"] = st.column_config.TextColumn(
-                "CV 30d",
-                help=(
-                    "Coefficient of Variation del close su 30gg. "
-                    "Valori < 0.5% indicano price pinning estremo."
-                ),
-            )
-
-        if "Range Rel" in disp.columns:
-            col_config["Range Rel"] = st.column_config.TextColumn(
-                "Range Rel",
-                help=(
-                    "Range relativo medio (H-L)/Close su 20gg. "
-                    "Valori < 0.8% indicano range giornaliero collassato."
-                ),
-            )
-
-        if "Vol Spike" in disp.columns:
-            col_config["Vol Spike"] = st.column_config.NumberColumn(
-                "Vol Spike",
-                format="%.1fx",
-                help=(
-                    "Volume spike su 180gg: max(volume) / median(volume). "
-                    "Valori > 5x indicano un evento storico (tipicamente "
-                    "annuncio di un deal)."
                 ),
             )
 
