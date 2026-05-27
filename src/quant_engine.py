@@ -26,15 +26,15 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # ── Default parameters (allineati al documento di progettazione) ──────────────
-RV_WINDOW: int              = 45    # Finestra RV "lunga" — regime storico
-RV_SHORT_WINDOW: int        = 20    # Finestra RV "corta" — squeeze recente
-RV_INTERMEDIATE_WINDOW: int = 60    # Finestra RV "intermedia" — regime recente
-PERCENTILE_LOOKBACK: int    = 756   # Lookback percentile (~3 anni trading days)
+RV_WINDOW: int              = 14    # Finestra RV "lunga" — regime storico
+RV_SHORT_WINDOW: int        = 5    # Finestra RV "corta" — squeeze recente
+RV_INTERMEDIATE_WINDOW: int = 14    # Finestra RV "intermedia" — regime recente
+PERCENTILE_LOOKBACK: int    = 252   # Lookback percentile (~1 anno trading days)
 ANNUALIZATION_FACTOR: float = np.sqrt(252)
 
 # ATR
-ATR_WINDOW: int                  = 14   # Finestra ATR (standard Wilder)
-ATR_PERCENTILE_LOOKBACK: int     = 252  # Lookback percentile ATR (~1 anno trading)
+ATR_WINDOW: int                  = 5   # Finestra ATR (standard Wilder)
+ATR_PERCENTILE_LOOKBACK: int     = 126  # Lookback percentile ATR (~6 mesi di trading)
 
 ADV_WINDOWS: list[int]  = [30, 90]
 MIN_DOLLAR_VOLUME: float = 50_000_000
@@ -44,14 +44,10 @@ COMPRESSION_THRESHOLD: float = 5.0     # Percentile soglia flag "Compresso" (leg
 STRADDLE_GATE_PCT: float     = 20.0    # Gate RV percentile per candidati straddle
 
 # Expansion ratio tier — basati sulla matematica del P/L straddle ATM
-# (vedi documentazione di progetto):
-#   - ratio < 2.0   → INSUFFICIENT  (espansione non sufficiente per target operativi)
-#   - 2.0 ≤ r < 3.0 → LOW           (target realistico: +50% premio)
-#   - 3.0 ≤ r < 4.5 → MEDIUM        (target realistico: +100% premio)
-#   - r ≥ 4.5       → HIGH          (target realistico: +200% premio)
-EXPANSION_TIER_LOW: float    = 2.0
-EXPANSION_TIER_MEDIUM: float = 3.0
-EXPANSION_TIER_HIGH: float   = 4.5
+
+EXPANSION_TIER_LOW: float    = 1.5   # (target realistico: +25% premio)
+EXPANSION_TIER_MEDIUM: float = 2.0   # (target realistico: +50% premio)
+EXPANSION_TIER_HIGH: float   = 3.0   # (target realistico: +80% premio)
 
 # ── Deal-Pending exclusion (popolata via News API) ────────────────────────────
 # I titoli oggetto di acquisizione vengono identificati con il News API EODHD
@@ -62,7 +58,7 @@ EXPANSION_TIER_HIGH: float   = 4.5
 # volatilita' naturale (asset manager, healthcare) producevano falsi positivi.
 
 # Storia minima in valori RV validi (non righe raw).
-MIN_VALID_RV_VALUES: int = PERCENTILE_LOOKBACK  # 756 valori RV non-NaN
+MIN_VALID_RV_VALUES: int = PERCENTILE_LOOKBACK  # 252 valori RV non-NaN
 
 
 # ── Phase A: Rendimenti Logaritmici ──────────────────────────────────────────
