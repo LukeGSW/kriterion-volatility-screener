@@ -62,10 +62,14 @@ EARNINGS_DAYS_AHEAD: int = 90
 
 # ── Deal-Pending (News M&A blacklist) ─────────────────────────────────────────
 # Configurazione fetch del News API EODHD con tag MERGERS AND ACQUISITIONS.
-# I ticker che appaiono in >= MA_NEWS_MIN_MENTIONS articoli distinti negli
-# ultimi MA_NEWS_LOOKBACK_DAYS sono esclusi dai candidati Long Straddle.
+# Il fetch applica un keyword filter sul titolo (DEAL_TITLE_PATTERN in
+# data_fetcher.py) per identificare SOLO articoli che annunciano un deal
+# specifico, escludendo Form 8.5 UK, articoli generici di settore,
+# dichiarazioni di mega-cap acquirer, e advisory news.
+# Con il keyword filter attivo, soglia min_mentions=1 e' sufficiente perche'
+# ogni articolo che matcha la regex e' gia' un segnale ad alta precisione.
 MA_NEWS_LOOKBACK_DAYS: int = 180   # finestra news
-MA_NEWS_MIN_MENTIONS: int  = 2     # soglia articoli distinti per blacklist
+MA_NEWS_MIN_MENTIONS: int  = 1     # soglia articoli distinti (con keyword filter ON)
 
 DATA_DIR: Path        = _REPO_ROOT / "data"
 OUTPUT_PARQUET: Path  = DATA_DIR / "screener_results.parquet"
