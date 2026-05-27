@@ -249,6 +249,7 @@ def analyze_ticker(
     rv_window: int           = RV_WINDOW,
     percentile_lookback: int = PERCENTILE_LOOKBACK,
     deal_pending_set: Optional[set] = None,
+    deal_pending_weights: Optional[Dict[str, float]] = None,
 ) -> Optional[dict]:
     """
     Analisi quantitativa completa per un singolo ticker.
@@ -363,8 +364,9 @@ def analyze_ticker(
     # ── Flag operativi ────────────────────────────────────────────────────────
     is_compressed   = float(pct_current) <= COMPRESSION_THRESHOLD
 
-    # Deal-pending: lookup nella blacklist esterna (popolata via News API).
+    # Deal-pending: lookup nella blacklist esterna (popolata da MNA ETF holdings).
     # Match su ticker base e su forma con suffisso .US (formato EODHD).
+    mna_etf_weight: Optional[float] = None
     if deal_pending_set is None:
         is_deal_pending = False
     else:
@@ -373,6 +375,15 @@ def analyze_ticker(
             or f"{ticker}.US" in deal_pending_set
             or ticker.replace(".US", "") in deal_pending_set
         )
+        # Estrai peso del ticker nell'ETF MNA (proxy della confidence del market
+        # nella chiusura del deal: peso alto = spread basso = high confidence)
+        if is_deal_pending and deal_pending_weights:
+            ticker_base = ticker.replace(".US", "")
+            mna_etf_weight = (
+                deal_pending_weights.get(ticker_base)
+                or deal_pending_weights.get(ticker)
+                or deal_pending_weights.get(f"{ticker}.US")
+            )
 
     # Gate Long Straddle:
     #   - rv_percentile_90 ≤ STRADDLE_GATE_PCT  (regime compresso)
@@ -409,6 +420,8 @@ def analyze_ticker(
         "is_compressed":         is_compressed,
         "is_deal_pending":       is_deal_pending,
         "is_straddle_candidate": is_straddle_candidate,
+        # MNA ETF weight (proxy confidence del deal)
+        "mna_etf_weight":        round(mna_etf_weight, 2) if mna_etf_weight is not None else None,
     }
 
 
@@ -502,6 +515,7 @@ def run_analysis(
     rv_window: int           = RV_WINDOW,
     percentile_lookback: int = PERCENTILE_LOOKBACK,
     deal_pending_set: Optional[set] = None,
+    deal_pending_weights: Optional[Dict[str, float]] = None,
 ) -> pd.DataFrame:
     """
     Analisi batch su tutti i ticker. Restituisce DataFrame ordinato per
@@ -512,10 +526,12 @@ def run_analysis(
 
     Parameters
     ----------
-    deal_pending_set : set di ticker (formato libero: 'AAPL', 'AAPL.US', ecc.)
-        da escludere dai candidati Straddle perche' oggetto di M&A in corso.
-        Tipicamente popolata via EODHD News API (tag MERGERS AND ACQUISITIONS).
-        Se None o set vuoto, nessuna esclusione viene applicata.
+    deal_pending_set : set di ticker da escludere dai candidati Straddle.
+        Tipicamente popolata dalle holdings dell'ETF NYLI MNA (Merger Arb).
+    deal_pending_weights : dict {ticker: pct_weight_in_ETF}
+        Mappa opzionale dei pesi dei ticker nell'ETF MNA. Usata per
+        arricchire il dataset con la colonna mna_etf_weight (proxy della
+        confidence del market nella chiusura del deal).
     """
     results        = []
     total          = len(ohlcv_data)
@@ -532,6 +548,7 @@ def run_analysis(
         result = analyze_ticker(
             ticker, df, rv_window, percentile_lookback,
             deal_pending_set=deal_pending_set,
+            deal_pending_weights=deal_pending_weights,
         )
         if result is not None:
             results.append(result)
@@ -601,7 +618,7 @@ def run_analysis(
     n_cand = int((df_out["is_straddle_candidate"] == True).sum())
     logger.info(
         f"STRADDLE CANDIDATES "
-        f"(gate: pct≤{STRADDLE_GATE_PCT} & rv_20<rv_60 & NOT deal_pending): "
+        f"(gate: pct≤{STRADDLE_GATE_PCT} & rv_20<rv_60 & NOT in MNA ETF): "
         f"{n_cand} ticker"
     )
 
