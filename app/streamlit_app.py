@@ -550,7 +550,7 @@ def main() -> None:
         <div style="font-size:0.75rem;color:#8b949e;line-height:1.8">
             <b style="color:#e6edf3">Parametri run:</b><br>
             RV Windows: <b style="color:#f0a500">{rv_s}/{rv_m}/{rv_w} gg</b><br>
-            Percentile Lookback: <b style="color:#f0a500">{pct_l} gg (~3y)</b><br>
+            Percentile Lookback: <b style="color:#f0a500">{pct_l} gg (~1y)</b><br>
             ATR: <b style="color:#f0a500">{atr_w}d, lookback {atr_lb}d (1y)</b><br>
             Gate Straddle: <b style="color:#f0a500">≤{gate_pct:.0f}° pct + rv₂₀&lt;rv₆₀</b><br>
             Soglia compressione: <b style="color:#f0a500">≤5° pct</b><br>
@@ -645,13 +645,13 @@ def main() -> None:
             )
 
         if "rv_current" in filt.columns:
-            disp["RV 90d (%)"] = filt["rv_current"].apply(
+            disp["RV 14d (%)"] = filt["rv_current"].apply(
                 lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
             )
 
         # Percentile — colonna chiave, mantenuta numerica per column_config
         if "rv_percentile" in filt.columns:
-            disp["RV Pct (3y)"] = filt["rv_percentile"]
+            disp["RV Pct (1y)"] = filt["rv_percentile"]
 
         # Nuove metriche multi-window
         if "rv_20" in filt.columns:
@@ -746,11 +746,11 @@ def main() -> None:
                 ),
             )
 
-        if "RV Pct (3y)" in disp.columns:
-            col_config["RV Pct (3y)"] = st.column_config.NumberColumn(
-                "RV Pct (3y)",
+        if "RV Pct (1y)" in disp.columns:
+            col_config["RV Pct (1y)"] = st.column_config.NumberColumn(
+                "RV Pct (1y)",
                 format="%.1f",
-                help="Percentile rolling 3 anni. Più basso = più compresso.",
+                help="Percentile rolling 1 anno (252gg). Più basso = più compresso.",
             )
 
         if "Term Struct" in disp.columns:
