@@ -60,16 +60,14 @@ HISTORY_YEARS: int     = 3               # Anni di storia OHLCV
 HISTORY_BUFFER_DAYS: int = 365
 EARNINGS_DAYS_AHEAD: int = 90
 
-# ── Deal-Pending (News M&A blacklist) ─────────────────────────────────────────
-# Configurazione fetch del News API EODHD con tag MERGERS AND ACQUISITIONS.
-# Il fetch applica un keyword filter sul titolo (DEAL_TITLE_PATTERN in
-# data_fetcher.py) per identificare SOLO articoli che annunciano un deal
-# specifico, escludendo Form 8.5 UK, articoli generici di settore,
-# dichiarazioni di mega-cap acquirer, e advisory news.
-# Con il keyword filter attivo, soglia min_mentions=1 e' sufficiente perche'
-# ogni articolo che matcha la regex e' gia' un segnale ad alta precisione.
-MA_NEWS_LOOKBACK_DAYS: int = 180   # finestra news
-MA_NEWS_MIN_MENTIONS: int  = 1     # soglia articoli distinti (con keyword filter ON)
+# ── Deal-Pending (NYLI Merger Arbitrage ETF blacklist) ───────────────────────
+# La blacklist e' popolata dalle holdings del NYLI Merger Arbitrage ETF (MNA),
+# un ETF gestito da NYLI che mantiene posizioni LONG sui target di takeover
+# annunciati globalmente. Cura professionale del gestore di fondo, zero
+# costi API. Vedi data_fetcher.MNA_ETF_CSV_URL.
+# Approccio precedente (News API EODHD) abbandonato perche' produceva troppi
+# falsi positivi (acquirer mega-cap come NVDA, GS, MS, APO finivano in
+# blacklist) e falsi negativi sui target veri.
 
 DATA_DIR: Path        = _REPO_ROOT / "data"
 OUTPUT_PARQUET: Path  = DATA_DIR / "screener_results.parquet"
@@ -211,23 +209,16 @@ def run_pipeline() -> None:
     n_with_data = sum(1 for d in ohlcv_data.values() if not d.empty)
     logger.info(f"OHLCV ricevuti: {n_with_data}/{n_universe} ticker con dati")
 
-    # ── Step 3b: Blacklist M&A via News API ──────────────────────────────────
-    # Una sola chiamata batch al News API per identificare ticker oggetto di
-    # acquisizione negli ultimi MA_NEWS_LOOKBACK_DAYS giorni. NO fallback:
-    # se la API fallisce, il pipeline si interrompe (EODHDError propagata).
+    # ── Step 3b: Blacklist Deal-Pending via NYLI MNA ETF ─────────────────────
+    # Una sola HTTP GET sul CSV pubblico delle holdings dell'ETF.
+    # NO fallback: se il download fallisce, il pipeline si interrompe.
+    logger.info("[3b/7] MNA ETF: fetch holdings per blacklist deal-pending...")
+    mna_holdings, mna_holdings_date = client.get_mna_etf_holdings()
+    deal_pending_set     = set(mna_holdings.keys())
+    deal_pending_weights = mna_holdings  # dict {ticker: pct_weight}
     logger.info(
-        f"[3b/7] News M&A: fetch blacklist "
-        f"({MA_NEWS_LOOKBACK_DAYS}gg lookback, min {MA_NEWS_MIN_MENTIONS} menzioni)..."
-    )
-    deal_pending_counts = client.get_ma_news_tickers(
-        days_lookback=MA_NEWS_LOOKBACK_DAYS,
-        min_mentions=MA_NEWS_MIN_MENTIONS,
-        market_suffix=".US",
-    )
-    deal_pending_set = set(deal_pending_counts.keys())
-    logger.info(
-        f"Blacklist M&A: {len(deal_pending_set)} ticker "
-        f"(esclusi dai candidati Straddle)"
+        f"Blacklist MNA ETF: {len(deal_pending_set)} ticker "
+        f"(holdings_date={mna_holdings_date}) — esclusi dai candidati Straddle"
     )
 
     # ── Step 4-5: Analisi quantitativa ───────────────────────────────────────
@@ -241,6 +232,7 @@ def run_pipeline() -> None:
         rv_window=RV_WINDOW,
         percentile_lookback=PERCENTILE_LOOKBACK,
         deal_pending_set=deal_pending_set,
+        deal_pending_weights=deal_pending_weights,
     )
 
     # ── Step 6a: Metadati universo ────────────────────────────────────────────
@@ -288,6 +280,8 @@ def run_pipeline() -> None:
             # Volume / prezzo / flags
             "adv_30d", "adv_90d", "close_price", "last_date",
             "is_compressed", "is_deal_pending", "is_straddle_candidate",
+            # MNA ETF
+            "mna_etf_weight",
             # Ranking Borda
             "rank_rv_pct", "rank_atr_pct", "rank_term_structure",
             "borda_score", "borda_rank",
@@ -331,10 +325,10 @@ def run_pipeline() -> None:
         "expansion_tier_low":         EXPANSION_TIER_LOW,
         "expansion_tier_medium":      EXPANSION_TIER_MEDIUM,
         "expansion_tier_high":        EXPANSION_TIER_HIGH,
-        # News M&A blacklist
-        "ma_news_lookback_days":      MA_NEWS_LOOKBACK_DAYS,
-        "ma_news_min_mentions":       MA_NEWS_MIN_MENTIONS,
-        "ma_news_blacklist_size":     len(deal_pending_set),
+        # MNA ETF (NYLI Merger Arbitrage) blacklist
+        "mna_etf_source":             "NYLI Merger Arbitrage ETF (MNA)",
+        "mna_etf_holdings_date":      mna_holdings_date,
+        "mna_etf_blacklist_size":     len(deal_pending_set),
         # Universo / volume
         "min_market_cap":             MIN_MARKET_CAP,
         "min_adv":                    MIN_ADV,
