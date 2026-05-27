@@ -40,6 +40,12 @@ from quant_engine import (
     ATR_PERCENTILE_LOOKBACK,
     ATR_WINDOW,
     COMPRESSION_THRESHOLD,
+    DEAL_CV_THRESHOLD,
+    DEAL_CV_WINDOW,
+    DEAL_RANGE_THRESHOLD,
+    DEAL_RANGE_WINDOW,
+    DEAL_VOLUME_SPIKE_THRESHOLD,
+    DEAL_VOLUME_WINDOW,
     EXPANSION_TIER_HIGH,
     EXPANSION_TIER_LOW,
     EXPANSION_TIER_MEDIUM,
@@ -254,6 +260,8 @@ def run_pipeline() -> None:
             "atr_pct", "atr_pct_percentile",
             # Expansion
             "expansion_ratio", "expansion_tier",
+            # Deal-pending detector
+            "cv_30", "range_rel_20", "volume_spike_180", "is_deal_pending",
             # Volume / prezzo / flags
             "adv_30d", "adv_90d", "close_price", "last_date",
             "is_compressed", "is_straddle_candidate",
@@ -272,36 +280,48 @@ def run_pipeline() -> None:
         int(results_df["is_straddle_candidate"].sum())
         if "is_straddle_candidate" in results_df.columns else 0
     )
+    n_deal       = (
+        int(results_df["is_deal_pending"].sum())
+        if "is_deal_pending" in results_df.columns else 0
+    )
 
     # ── Step 7: Metadati run e salvataggio ────────────────────────────────────
     metadata = {
-        "run_timestamp":            run_ts.isoformat(),
-        "tickers_scanned":          n_universe,
-        "tickers_with_data":        n_with_data,
-        "tickers_passed_filters":   n_qualified,
-        "tickers_compressed":       n_compressed,
+        "run_timestamp":              run_ts.isoformat(),
+        "tickers_scanned":            n_universe,
+        "tickers_with_data":          n_with_data,
+        "tickers_passed_filters":     n_qualified,
+        "tickers_compressed":         n_compressed,
         "tickers_straddle_candidate": n_straddle,
+        "tickers_deal_pending":       n_deal,
         # Parametri RV
-        "rv_window":                RV_WINDOW,
-        "rv_short_window":          RV_SHORT_WINDOW,
-        "rv_intermediate_window":   RV_INTERMEDIATE_WINDOW,
-        "percentile_lookback":      PERCENTILE_LOOKBACK,
+        "rv_window":                  RV_WINDOW,
+        "rv_short_window":            RV_SHORT_WINDOW,
+        "rv_intermediate_window":     RV_INTERMEDIATE_WINDOW,
+        "percentile_lookback":        PERCENTILE_LOOKBACK,
         # Parametri ATR
-        "atr_window":               ATR_WINDOW,
-        "atr_percentile_lookback":  ATR_PERCENTILE_LOOKBACK,
+        "atr_window":                 ATR_WINDOW,
+        "atr_percentile_lookback":    ATR_PERCENTILE_LOOKBACK,
         # Soglie
-        "compression_threshold":    COMPRESSION_THRESHOLD,
-        "straddle_gate_pct":        STRADDLE_GATE_PCT,
-        "expansion_tier_low":       EXPANSION_TIER_LOW,
-        "expansion_tier_medium":    EXPANSION_TIER_MEDIUM,
-        "expansion_tier_high":      EXPANSION_TIER_HIGH,
+        "compression_threshold":      COMPRESSION_THRESHOLD,
+        "straddle_gate_pct":          STRADDLE_GATE_PCT,
+        "expansion_tier_low":         EXPANSION_TIER_LOW,
+        "expansion_tier_medium":      EXPANSION_TIER_MEDIUM,
+        "expansion_tier_high":        EXPANSION_TIER_HIGH,
+        # Deal-pending detector
+        "deal_cv_window":             DEAL_CV_WINDOW,
+        "deal_range_window":          DEAL_RANGE_WINDOW,
+        "deal_volume_window":         DEAL_VOLUME_WINDOW,
+        "deal_cv_threshold":          DEAL_CV_THRESHOLD,
+        "deal_range_threshold":       DEAL_RANGE_THRESHOLD,
+        "deal_volume_spike_threshold": DEAL_VOLUME_SPIKE_THRESHOLD,
         # Universo / volume
-        "min_market_cap":           MIN_MARKET_CAP,
-        "min_adv":                  MIN_ADV,
-        "history_years":            HISTORY_YEARS,
-        "history_buffer_days":      HISTORY_BUFFER_DAYS,
-        "from_date":                from_date,
-        "to_date":                  to_date,
+        "min_market_cap":             MIN_MARKET_CAP,
+        "min_adv":                    MIN_ADV,
+        "history_years":              HISTORY_YEARS,
+        "history_buffer_days":        HISTORY_BUFFER_DAYS,
+        "from_date":                  from_date,
+        "to_date":                    to_date,
     }
 
     _save_results(results_df, metadata)
@@ -312,6 +332,7 @@ def run_pipeline() -> None:
         f"{n_with_data} con dati | "
         f"{n_qualified} qualificati | "
         f"{n_compressed} COMPRESSI (≤{COMPRESSION_THRESHOLD}° pct) | "
+        f"{n_deal} DEAL-PENDING (esclusi) | "
         f"{n_straddle} STRADDLE CANDIDATES"
     )
     logger.info("=" * 65)
