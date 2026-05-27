@@ -447,7 +447,7 @@ def main() -> None:
         if exclude_earnings:
             earn_threshold = st.slider(
                 "Soglia giorni a Earnings",
-                min_value=5, max_value=30, value=15, step=5,
+                min_value=5, max_value=30, value=10, step=5,
                 help="Nascondi se Days_To_Earnings < soglia",
             )
 
@@ -524,7 +524,7 @@ def main() -> None:
         if has_exp:
             min_expansion_ratio = st.slider(
                 "Expansion Ratio minimo",
-                min_value=1.0, max_value=8.0, value=2.0, step=0.5,
+                min_value=1.0, max_value=8.0, value=1.5, step=0.5,
                 help=(
                     "rv_52w_max / rv_current. Proxy del potenziale di espansione. "
                     "≥2.0 LOW (target +50%), ≥3.0 MEDIUM (target +100%), "
