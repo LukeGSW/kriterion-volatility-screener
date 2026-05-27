@@ -331,7 +331,7 @@ def run_pipeline() -> None:
         "mna_etf_blacklist_size":     len(deal_pending_set),
         # Universo / volume
         "min_market_cap":             MIN_MARKET_CAP,
-        "min_adv":                    MIN_ADV,
+        "min_dollar_volume":          MIN_DOLLAR_VOLUME,
         "history_years":              HISTORY_YEARS,
         "history_buffer_days":        HISTORY_BUFFER_DAYS,
         "from_date":                  from_date,
