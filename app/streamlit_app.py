@@ -406,7 +406,7 @@ def main() -> None:
         # Percentile soglia
         max_pct = st.slider(
             "RV Percentile massimo",
-            min_value=1, max_value=50, value=10, step=1,
+            min_value=1, max_value=50, value=5, step=1,
             help="Mostra solo ticker con RV Percentile ≤ questo valore",
         )
 
@@ -458,7 +458,7 @@ def main() -> None:
 
         show_only_straddle = st.toggle(
             "Solo candidati Straddle",
-            value=False,
+            value=True,
             help=(
                 "Applica il gate: RV percentile ≤ 20 AND rv_20 < rv_60 "
                 "(term structure inversa) AND NOT deal-pending. "
@@ -490,7 +490,7 @@ def main() -> None:
         if has_atr:
             max_atr_pct = st.slider(
                 "ATR Percentile massimo",
-                min_value=1, max_value=100, value=100, step=5,
+                min_value=1, max_value=100, value=25, step=5,
                 help=(
                     "ATR(14)/Close percentile su 252gg. "
                     "Valori bassi indicano range giornaliero compresso. "
@@ -524,7 +524,7 @@ def main() -> None:
         if has_exp:
             min_expansion_ratio = st.slider(
                 "Expansion Ratio minimo",
-                min_value=1.0, max_value=8.0, value=1.0, step=0.5,
+                min_value=1.0, max_value=8.0, value=2.0, step=0.5,
                 help=(
                     "rv_52w_max / rv_current. Proxy del potenziale di espansione. "
                     "≥2.0 LOW (target +50%), ≥3.0 MEDIUM (target +100%), "
