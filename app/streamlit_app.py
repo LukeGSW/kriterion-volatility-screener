@@ -861,29 +861,28 @@ def main() -> None:
                 )
 
                 with cols[col_idx]:
-                    st.markdown(f"""
-                    <div class="kq-ticker-card">
-                        <div style="font-size:0.7rem;color:#8b949e;
-                                    text-transform:uppercase;letter-spacing:0.08em">
-                            Borda {brank_str}
-                        </div>
-                        <div class="kq-ticker-name">{ticker}</div>
-                        <div class="kq-ticker-pct">{rvp_str}</div>
-                        <div style="font-size:0.75rem;color:#e6edf3;margin-top:0.35rem">
-                            <span style="color:{_term_color(ts)}">{ts_str}</span> ·
-                            <span>{atr_str}</span> ·
-                            <span>{exp_str}</span>
-                        </div>
-                        <div style="margin-top:0.35rem">{_tier_badge(tier)}</div>
-                        <div class="kq-ticker-earn" style="color:{ec};margin-top:0.4rem">
-                            {dte_str}
-                        </div>
-                        <div class="kq-ticker-links">
-                            <a href="{_tv_url(ticker)}" target="_blank">📈 TV</a>
-                            <a href="{_yf_url(ticker)}" target="_blank">🔗 YF</a>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    card_html = (
+                        f'<div class="kq-ticker-card">'
+                        f'<div style="font-size:0.7rem;color:#8b949e;'
+                        f'text-transform:uppercase;letter-spacing:0.08em">'
+                        f'Borda {brank_str}</div>'
+                        f'<div class="kq-ticker-name">{ticker}</div>'
+                        f'<div class="kq-ticker-pct">{rvp_str}</div>'
+                        f'<div style="font-size:0.75rem;color:#e6edf3;margin-top:0.35rem">'
+                        f'<span style="color:{_term_color(ts)}">{ts_str}</span> · '
+                        f'<span>{atr_str}</span> · '
+                        f'<span>{exp_str}</span>'
+                        f'</div>'
+                        f'<div style="margin-top:0.35rem">{_tier_badge(tier)}</div>'
+                        f'<div class="kq-ticker-earn" style="color:{ec};margin-top:0.4rem">'
+                        f'{dte_str}</div>'
+                        f'<div class="kq-ticker-links">'
+                        f'<a href="{_tv_url(ticker)}" target="_blank">📈 TV</a>'
+                        f'<a href="{_yf_url(ticker)}" target="_blank">🔗 YF</a>'
+                        f'</div>'
+                        f'</div>'
+                    )
+                    st.markdown(card_html, unsafe_allow_html=True)
 
     # ── Compression Zone cards ────────────────────────────────────────────────
     compressed = filt[filt["rv_percentile"] <= 5.0] if "rv_percentile" in filt.columns else pd.DataFrame()
@@ -929,21 +928,21 @@ def main() -> None:
                 )
 
                 with cols[col_idx]:
-                    st.markdown(f"""
-                    <div class="kq-ticker-card">
-                        <div class="kq-ticker-name">{ticker}</div>
-                        <div class="kq-ticker-rv">{rv_str}</div>
-                        <div class="kq-ticker-pct">{pct_str}</div>
-                        {deal_badge}
-                        <div class="kq-ticker-earn" style="color:{ec}">
-                            {dte_str}
-                        </div>
-                        <div class="kq-ticker-links">
-                            <a href="{_tv_url(ticker)}" target="_blank">📈 TV</a>
-                            <a href="{_yf_url(ticker)}" target="_blank">🔗 YF</a>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    card_html = (
+                        f'<div class="kq-ticker-card">'
+                        f'<div class="kq-ticker-name">{ticker}</div>'
+                        f'<div class="kq-ticker-rv">{rv_str}</div>'
+                        f'<div class="kq-ticker-pct">{pct_str}</div>'
+                        f'{deal_badge}'
+                        f'<div class="kq-ticker-earn" style="color:{ec}">'
+                        f'{dte_str}</div>'
+                        f'<div class="kq-ticker-links">'
+                        f'<a href="{_tv_url(ticker)}" target="_blank">📈 TV</a>'
+                        f'<a href="{_yf_url(ticker)}" target="_blank">🔗 YF</a>'
+                        f'</div>'
+                        f'</div>'
+                    )
+                    st.markdown(card_html, unsafe_allow_html=True)
 
     # ── Distribuzione RV Percentile ───────────────────────────────────────────
     st.markdown("<hr>", unsafe_allow_html=True)
