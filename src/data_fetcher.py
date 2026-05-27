@@ -538,6 +538,9 @@ class EODHDClient:
 
         url = "{}/news".format(BASE_URL)
         ticker_counts: Dict[str, int] = {}
+        # Conteggio dei symbol "scartati" dal filtro market per diagnostica
+        rejected_suffix_samples: Dict[str, int] = {}
+        sample_articles_logged = 0
         total_articles = 0
         offset         = 0
         page_idx       = 0
@@ -583,6 +586,16 @@ class EODHDClient:
                 symbols = article.get("symbols") or []
                 if not isinstance(symbols, list):
                     continue
+
+                # DIAGNOSTICA: log dei primi 3 articoli per verificare formato symbols
+                if sample_articles_logged < 3:
+                    title = article.get("title", "")[:80]
+                    logger.info(
+                        "News M&A sample %d: symbols=%s | title='%s'",
+                        sample_articles_logged + 1, symbols, title,
+                    )
+                    sample_articles_logged += 1
+
                 # Set per articolo: ogni ticker conta 1 volta per articolo
                 article_tickers = set()
                 for sym in symbols:
@@ -591,6 +604,17 @@ class EODHDClient:
                     sym = sym.strip()
                     # Filtro market suffix
                     if market_suffix and not sym.endswith(market_suffix):
+                        # Diagnostica: conteggio dei suffissi scartati
+                        # (per capire se EODHD usa formati alternativi)
+                        if "." in sym:
+                            suf = sym[sym.rindex("."):]
+                            rejected_suffix_samples[suf] = (
+                                rejected_suffix_samples.get(suf, 0) + 1
+                            )
+                        else:
+                            rejected_suffix_samples["NO_SUFFIX"] = (
+                                rejected_suffix_samples.get("NO_SUFFIX", 0) + 1
+                            )
                         continue
                     # Estrai ticker base (senza suffisso)
                     base = sym[:-len(market_suffix)] if market_suffix else sym
@@ -637,6 +661,34 @@ class EODHDClient:
             logger.info(
                 "Top blacklist (ticker, n_mentions): %s",
                 ", ".join("{}={}".format(t, n) for t, n in top),
+            )
+
+        # ── Diagnostica per debug della copertura ────────────────────────────
+        # 1. Conteggio dei suffissi scartati (per capire se EODHD usa formati
+        #    diversi da .US per alcuni ticker quotati su US exchanges)
+        if rejected_suffix_samples:
+            top_rej = sorted(
+                rejected_suffix_samples.items(), key=lambda kv: -kv[1]
+            )[:15]
+            logger.info(
+                "News M&A — suffissi scartati dal filtro '%s' (top 15): %s",
+                market_suffix,
+                ", ".join("{}={}".format(s, n) for s, n in top_rej),
+            )
+
+        # 2. Ticker sotto soglia: utile per capire se min_mentions e' troppo
+        #    restrittivo. Mostra i top 30 sotto soglia (con conteggio < min_mentions).
+        below_threshold = {
+            t: n for t, n in ticker_counts.items() if n < min_mentions
+        }
+        if below_threshold:
+            top_below = sorted(
+                below_threshold.items(), key=lambda kv: -kv[1]
+            )[:30]
+            logger.info(
+                "News M&A — ticker sotto soglia (n<%d), top 30: %s",
+                min_mentions,
+                ", ".join("{}={}".format(t, n) for t, n in top_below),
             )
 
         return blacklist
