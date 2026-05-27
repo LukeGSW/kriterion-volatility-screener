@@ -37,7 +37,7 @@ ATR_WINDOW: int                  = 14   # Finestra ATR (standard Wilder)
 ATR_PERCENTILE_LOOKBACK: int     = 252  # Lookback percentile ATR (~1 anno trading)
 
 ADV_WINDOWS: list[int]  = [30, 90]
-MIN_ADV: float          = 1_500_000
+MIN_DOLLAR_VOLUME       = 50_000_000
 
 # Soglie operative
 COMPRESSION_THRESHOLD: float = 5.0     # Percentile soglia flag "Compresso" (legacy)
