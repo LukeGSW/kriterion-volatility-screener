@@ -216,6 +216,46 @@ def _earn_color(dte: Optional[float]) -> str:
     return "#8b949e"
 
 
+def _tier_color(tier: object) -> str:
+    """Colore hex per l'expansion tier."""
+    t = str(tier) if tier is not None else ""
+    if t == "HIGH":
+        return "#3fb950"      # verde — target +200% raggiungibile
+    if t == "MEDIUM":
+        return "#a8c880"      # verde chiaro — target +100%
+    if t == "LOW":
+        return "#f0c040"      # giallo — target +50%
+    if t == "INSUFFICIENT":
+        return "#f85149"      # rosso — espansione strutturalmente debole
+    return "#8b949e"          # N/A
+
+
+def _tier_badge(tier: object) -> str:
+    """Badge HTML inline per l'expansion tier."""
+    t = str(tier) if tier is not None else "N/A"
+    c = _tier_color(t)
+    return (
+        f'<span style="background:rgba(0,0,0,0.0);'
+        f'color:{c};font-weight:600;font-size:0.78rem;'
+        f'border:1px solid {c};border-radius:6px;'
+        f'padding:0.08rem 0.45rem">{t}</span>'
+    )
+
+
+def _term_color(ratio: object) -> str:
+    """Colore per il rapporto rv_20/rv_60."""
+    if ratio is None or (isinstance(ratio, float) and np.isnan(ratio)):
+        return "#8b949e"
+    r = float(ratio)
+    if r < 0.7:
+        return "#f0a500"      # squeeze acuto
+    if r < 0.85:
+        return "#f0c040"
+    if r < 1.0:
+        return "#a8c880"
+    return "#8b949e"          # term structure neutra/positiva
+
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def _load_data() -> tuple[pd.DataFrame, dict]:
@@ -232,7 +272,13 @@ def _load_data() -> tuple[pd.DataFrame, dict]:
 
     # Forza tipi corretti
     for col in ["rv_current", "rv_percentile", "rv_52w_min", "rv_52w_max",
-                "close_price", "market_cap"]:
+                "close_price", "market_cap",
+                # nuove metriche
+                "rv_20", "rv_60", "rv_term_structure",
+                "atr_pct", "atr_pct_percentile",
+                "expansion_ratio",
+                "borda_score", "borda_rank",
+                "rank_rv_pct", "rank_atr_pct", "rank_term_structure"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -245,6 +291,9 @@ def _load_data() -> tuple[pd.DataFrame, dict]:
 
     if "is_compressed" in df.columns:
         df["is_compressed"] = df["is_compressed"].astype(bool)
+
+    if "is_straddle_candidate" in df.columns:
+        df["is_straddle_candidate"] = df["is_straddle_candidate"].astype(bool)
 
     return df, metadata
 
@@ -289,8 +338,14 @@ def main() -> None:
     n_scanned    = meta.get("tickers_scanned", len(df) if not df.empty else 0)
     n_qualified  = meta.get("tickers_passed_filters", len(df) if not df.empty else 0)
     n_compressed = meta.get("tickers_compressed", 0)
+    n_straddle   = meta.get(
+        "tickers_straddle_candidate",
+        int(df["is_straddle_candidate"].sum()) if (
+            not df.empty and "is_straddle_candidate" in df.columns
+        ) else 0,
+    )
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.markdown(f"""
         <div class="kq-card">
@@ -310,6 +365,12 @@ def main() -> None:
             <div class="kq-card-label">⚡ Compressi ≤5° Pct</div>
         </div>""", unsafe_allow_html=True)
     with c4:
+        st.markdown(f"""
+        <div class="kq-card">
+            <div class="kq-card-value">{n_straddle}</div>
+            <div class="kq-card-label">🎯 Straddle Candidates</div>
+        </div>""", unsafe_allow_html=True)
+    with c5:
         st.markdown(f"""
         <div class="kq-card">
             <div class="kq-card-value accent-white">{ts_display}</div>
@@ -377,14 +438,87 @@ def main() -> None:
 
         st.markdown("---")
 
+        # ── Filtri Long Straddle (nuovi) ──────────────────────────────────────
+        st.markdown("**🎯 Filtri Long Straddle**")
+
+        show_only_straddle = st.toggle(
+            "Solo candidati Straddle",
+            value=False,
+            help=(
+                "Applica il gate: RV percentile ≤ 20 AND rv_20 < rv_60 "
+                "(term structure inversa). I candidati sono ordinati per "
+                "Borda rank crescente."
+            ),
+        )
+
+        has_atr = (
+            "atr_pct_percentile" in df.columns
+            and df["atr_pct_percentile"].notna().any()
+        )
+        if has_atr:
+            max_atr_pct = st.slider(
+                "ATR Percentile massimo",
+                min_value=1, max_value=100, value=100, step=5,
+                help=(
+                    "ATR(14)/Close percentile su 252gg. "
+                    "Valori bassi indicano range giornaliero compresso. "
+                    "Imposta 100 per disattivare il filtro."
+                ),
+            )
+        else:
+            max_atr_pct = 100
+
+        has_term = (
+            "rv_term_structure" in df.columns
+            and df["rv_term_structure"].notna().any()
+        )
+        if has_term:
+            max_term_structure = st.slider(
+                "Term Structure max (rv_20/rv_60)",
+                min_value=0.50, max_value=1.50, value=1.50, step=0.05,
+                help=(
+                    "Rapporto RV breve / RV intermedia. "
+                    "< 1.0 = squeeze attivo. < 0.7 = squeeze acuto. "
+                    "Imposta 1.50 per disattivare il filtro."
+                ),
+            )
+        else:
+            max_term_structure = 1.50
+
+        has_exp = (
+            "expansion_ratio" in df.columns
+            and df["expansion_ratio"].notna().any()
+        )
+        if has_exp:
+            min_expansion_ratio = st.slider(
+                "Expansion Ratio minimo",
+                min_value=1.0, max_value=8.0, value=1.0, step=0.5,
+                help=(
+                    "rv_52w_max / rv_current. Proxy del potenziale di espansione. "
+                    "≥2.0 LOW (target +50%), ≥3.0 MEDIUM (target +100%), "
+                    "≥4.5 HIGH (target +200%). Imposta 1.0 per disattivare."
+                ),
+            )
+        else:
+            min_expansion_ratio = 1.0
+
+        st.markdown("---")
+
         # Parametri run (sola lettura)
-        rv_w  = meta.get("rv_window", 90)
-        pct_l = meta.get("percentile_lookback", 756)
+        rv_w     = meta.get("rv_window", 90)
+        rv_s     = meta.get("rv_short_window", 20)
+        rv_m     = meta.get("rv_intermediate_window", 60)
+        pct_l    = meta.get("percentile_lookback", 756)
+        atr_w    = meta.get("atr_window", 14)
+        atr_lb   = meta.get("atr_percentile_lookback", 252)
+        gate_pct = meta.get("straddle_gate_pct", 20.0)
         st.markdown(f"""
         <div style="font-size:0.75rem;color:#8b949e;line-height:1.8">
             <b style="color:#e6edf3">Parametri run:</b><br>
-            RV Window: <b style="color:#f0a500">{rv_w} gg</b><br>
+            RV Windows: <b style="color:#f0a500">{rv_s}/{rv_m}/{rv_w} gg</b><br>
             Percentile Lookback: <b style="color:#f0a500">{pct_l} gg (~3y)</b><br>
+            ATR: <b style="color:#f0a500">{atr_w}d, lookback {atr_lb}d (1y)</b><br>
+            Gate Straddle: <b style="color:#f0a500">≤{gate_pct:.0f}° pct + rv₂₀&lt;rv₆₀</b><br>
             Soglia compressione: <b style="color:#f0a500">≤5° pct</b><br>
             ADV minimo: <b style="color:#f0a500">1.5M share</b>
         </div>
@@ -407,6 +541,34 @@ def main() -> None:
         mask_safe    = filt["days_to_earnings"] >= earn_threshold
         filt = filt[mask_no_earn | mask_safe]
 
+    # ── Filtri Long Straddle (nuovi) ──────────────────────────────────────────
+    if show_only_straddle and "is_straddle_candidate" in filt.columns:
+        filt = filt[filt["is_straddle_candidate"] == True]
+
+    if has_atr and max_atr_pct < 100:
+        # Tiene anche i NaN, l'utente vede comunque il ticker (con tier N/A)
+        mask_atr_na = filt["atr_pct_percentile"].isna()
+        mask_atr_ok = filt["atr_pct_percentile"] <= max_atr_pct
+        filt = filt[mask_atr_na | mask_atr_ok]
+
+    if has_term and max_term_structure < 1.50:
+        mask_term_na = filt["rv_term_structure"].isna()
+        mask_term_ok = filt["rv_term_structure"] <= max_term_structure
+        filt = filt[mask_term_na | mask_term_ok]
+
+    if has_exp and min_expansion_ratio > 1.0:
+        mask_exp_na = filt["expansion_ratio"].isna()
+        mask_exp_ok = filt["expansion_ratio"] >= min_expansion_ratio
+        filt = filt[mask_exp_na | mask_exp_ok]
+
+    # Se siamo in "solo candidati", ordina per Borda rank (più basso = migliore)
+    if show_only_straddle and "borda_rank" in filt.columns and not filt.empty:
+        filt = filt.sort_values(
+            by=["borda_rank", "rv_percentile"],
+            ascending=[True, True],
+            na_position="last",
+        ).reset_index(drop=True)
+
     # ── Main results table ────────────────────────────────────────────────────
     st.markdown(
         f'<div class="kq-section">📋 Risultati — {len(filt)} ticker '
@@ -419,6 +581,11 @@ def main() -> None:
     else:
         # Prepara DataFrame display
         disp = pd.DataFrame()
+
+        # Borda rank in prima colonna se siamo in modalità candidati
+        if show_only_straddle and "borda_rank" in filt.columns:
+            disp["Borda #"] = filt["borda_rank"]
+
         disp["Ticker"] = filt["ticker"]
 
         if "name" in filt.columns:
@@ -443,6 +610,36 @@ def main() -> None:
         # Percentile — colonna chiave, mantenuta numerica per column_config
         if "rv_percentile" in filt.columns:
             disp["RV Pct (3y)"] = filt["rv_percentile"]
+
+        # Nuove metriche multi-window
+        if "rv_20" in filt.columns:
+            disp["RV 20d (%)"] = filt["rv_20"].apply(
+                lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+            )
+
+        if "rv_60" in filt.columns:
+            disp["RV 60d (%)"] = filt["rv_60"].apply(
+                lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+            )
+
+        if "rv_term_structure" in filt.columns:
+            disp["Term Struct"] = filt["rv_term_structure"]
+
+        # ATR
+        if "atr_pct" in filt.columns:
+            disp["ATR%"] = filt["atr_pct"].apply(
+                lambda x: f"{x:.2f}%" if pd.notna(x) else "—"
+            )
+
+        if "atr_pct_percentile" in filt.columns:
+            disp["ATR Pct (1y)"] = filt["atr_pct_percentile"]
+
+        # Expansion
+        if "expansion_ratio" in filt.columns:
+            disp["Exp. Ratio"] = filt["expansion_ratio"]
+
+        if "expansion_tier" in filt.columns:
+            disp["Tier"] = filt["expansion_tier"].fillna("N/A")
 
         if "rv_52w_min" in filt.columns:
             disp["RV 52w Min"] = filt["rv_52w_min"].apply(
@@ -486,11 +683,58 @@ def main() -> None:
             ),
         }
 
+        if "Borda #" in disp.columns:
+            col_config["Borda #"] = st.column_config.NumberColumn(
+                "Borda #",
+                format="%d",
+                help=(
+                    "Ranking aggregato (Borda count). "
+                    "Somma dei rank su RV percentile, ATR percentile, term structure. "
+                    "Più basso = candidato migliore."
+                ),
+            )
+
         if "RV Pct (3y)" in disp.columns:
             col_config["RV Pct (3y)"] = st.column_config.NumberColumn(
                 "RV Pct (3y)",
                 format="%.1f",
                 help="Percentile rolling 3 anni. Più basso = più compresso.",
+            )
+
+        if "Term Struct" in disp.columns:
+            col_config["Term Struct"] = st.column_config.NumberColumn(
+                "Term Struct",
+                format="%.2f",
+                help=(
+                    "rv_20 / rv_60. < 1.0 = compressione attiva, "
+                    "< 0.7 = squeeze acuto."
+                ),
+            )
+
+        if "ATR Pct (1y)" in disp.columns:
+            col_config["ATR Pct (1y)"] = st.column_config.NumberColumn(
+                "ATR Pct (1y)",
+                format="%.1f",
+                help="ATR(14)/Close percentile su lookback 252gg.",
+            )
+
+        if "Exp. Ratio" in disp.columns:
+            col_config["Exp. Ratio"] = st.column_config.NumberColumn(
+                "Exp. Ratio",
+                format="%.2f",
+                help=(
+                    "rv_52w_max / rv_current. Potenziale di espansione. "
+                    "≥2 LOW, ≥3 MEDIUM, ≥4.5 HIGH."
+                ),
+            )
+
+        if "Tier" in disp.columns:
+            col_config["Tier"] = st.column_config.TextColumn(
+                "Tier",
+                help=(
+                    "INSUFFICIENT (<2x), LOW (target +50%), "
+                    "MEDIUM (target +100%), HIGH (target +200%)."
+                ),
             )
 
         if "Days to Earn." in disp.columns:
@@ -504,9 +748,84 @@ def main() -> None:
             disp,
             use_container_width=True,
             hide_index=True,
-            height=min(620, 60 + len(disp) * 36),
+            height=min(680, 60 + len(disp) * 36),
             column_config=col_config,
         )
+
+    # ── Top Straddle Candidates (Borda ranking) ───────────────────────────────
+    if (
+        "is_straddle_candidate" in df.columns
+        and "borda_rank" in df.columns
+        and df["is_straddle_candidate"].any()
+    ):
+        candidates = df[df["is_straddle_candidate"] == True].copy()
+        candidates = candidates.sort_values(
+            by=["borda_rank", "rv_percentile"],
+            ascending=[True, True],
+            na_position="last",
+        )
+        n_show = min(8, len(candidates))
+        top_cand = candidates.head(n_show)
+
+        st.markdown("<hr>", unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="kq-section">🎯 Top Straddle Candidates — '
+            f'Borda Ranking ({len(candidates)} totali, top {n_show})</div>',
+            unsafe_allow_html=True,
+        )
+
+        N_COLS = 4
+        rows_c = [
+            top_cand.iloc[i: i + N_COLS]
+            for i in range(0, len(top_cand), N_COLS)
+        ]
+
+        for row_df in rows_c:
+            cols = st.columns(N_COLS)
+            for col_idx, (_, row) in enumerate(row_df.iterrows()):
+                ticker  = row.get("ticker", "")
+                brank   = row.get("borda_rank")
+                rv_pct  = row.get("rv_percentile")
+                ts      = row.get("rv_term_structure")
+                atr_p   = row.get("atr_pct_percentile")
+                exp_r   = row.get("expansion_ratio")
+                tier    = row.get("expansion_tier", "N/A")
+                dte     = row.get("days_to_earnings")
+                ec      = _earn_color(dte if pd.notna(dte) else None)
+
+                brank_str = f"#{int(brank)}" if pd.notna(brank) else "—"
+                rvp_str   = f"{rv_pct:.1f}° pct" if pd.notna(rv_pct) else "—"
+                ts_str    = f"TS {ts:.2f}" if pd.notna(ts) else "TS —"
+                atr_str   = f"ATR {atr_p:.0f}°" if pd.notna(atr_p) else "ATR —"
+                exp_str   = f"Exp {exp_r:.1f}x" if pd.notna(exp_r) else "Exp —"
+                dte_str   = (
+                    f"Earn: {int(dte)}gg" if pd.notna(dte) else "Earn: N/A"
+                )
+
+                with cols[col_idx]:
+                    st.markdown(f"""
+                    <div class="kq-ticker-card">
+                        <div style="font-size:0.7rem;color:#8b949e;
+                                    text-transform:uppercase;letter-spacing:0.08em">
+                            Borda {brank_str}
+                        </div>
+                        <div class="kq-ticker-name">{ticker}</div>
+                        <div class="kq-ticker-pct">{rvp_str}</div>
+                        <div style="font-size:0.75rem;color:#e6edf3;margin-top:0.35rem">
+                            <span style="color:{_term_color(ts)}">{ts_str}</span> ·
+                            <span>{atr_str}</span> ·
+                            <span>{exp_str}</span>
+                        </div>
+                        <div style="margin-top:0.35rem">{_tier_badge(tier)}</div>
+                        <div class="kq-ticker-earn" style="color:{ec};margin-top:0.4rem">
+                            {dte_str}
+                        </div>
+                        <div class="kq-ticker-links">
+                            <a href="{_tv_url(ticker)}" target="_blank">📈 TV</a>
+                            <a href="{_yf_url(ticker)}" target="_blank">🔗 YF</a>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
     # ── Compression Zone cards ────────────────────────────────────────────────
     compressed = filt[filt["rv_percentile"] <= 5.0] if "rv_percentile" in filt.columns else pd.DataFrame()
@@ -700,13 +1019,16 @@ def main() -> None:
                 padding:1.2rem 1.5rem;font-size:0.8rem;color:#8b949e;line-height:1.9">
         <b style="color:#f0a500;font-size:0.85rem">⚡ Regole operative Long Straddle (reference)</b><br>
         <b style="color:#e6edf3">Entry:</b>
-            Acquisto Call + Put ATM, stessa scadenza, DTE ≈ 90 giorni.<br>
+            Acquisto Call + Put ATM, stessa scadenza, DTE ≈ 70–90 giorni.<br>
         <b style="color:#e6edf3">Time Stop:</b>
-            Chiusura tassativa a DTE residui = 30 (max permanenza 60 gg).<br>
+            Chiusura tassativa a DTE residui = 30 (max permanenza ~60 gg).<br>
         <b style="color:#f0c040">Event Risk Rule:</b>
             Chiusura il giorno precedente agli Earnings — incassa Vega run-up, evita IV Crush.<br>
-        <b style="color:#3fb950">Profit Target:</b>
-            +100% sul premio netto pagato, o in prossimità di livelli volumetrici rilevanti.<br>
+        <b style="color:#3fb950">Profit Target dinamico — guidato da Expansion Tier:</b><br>
+        &nbsp;&nbsp;• <span style="color:#f0c040">LOW</span> (ratio 2.0–3.0): target <b>+50%</b> sul premio<br>
+        &nbsp;&nbsp;• <span style="color:#a8c880">MEDIUM</span> (ratio 3.0–4.5): target <b>+100%</b> sul premio<br>
+        &nbsp;&nbsp;• <span style="color:#3fb950">HIGH</span> (ratio ≥4.5): target <b>+200%</b> sul premio<br>
+        &nbsp;&nbsp;• <span style="color:#f85149">INSUFFICIENT</span> (ratio &lt;2.0): setup strutturalmente debole — evitare.<br>
         <b style="color:#f85149">No hard stop loss</b> basato su percentuale di perdita o livello di prezzo.
     </div>
     """, unsafe_allow_html=True)
