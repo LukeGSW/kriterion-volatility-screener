@@ -37,7 +37,7 @@ ATR_WINDOW: int                  = 14   # Finestra ATR (standard Wilder)
 ATR_PERCENTILE_LOOKBACK: int     = 252  # Lookback percentile ATR (~1 anno trading)
 
 ADV_WINDOWS: list[int]  = [30, 90]
-MIN_DOLLAR_VOLUME       = 50_000_000
+MIN_DOLLAR_VOLUME: float = 50_000_000
 
 # Soglie operative
 COMPRESSION_THRESHOLD: float = 5.0     # Percentile soglia flag "Compresso" (legacy)
@@ -285,15 +285,21 @@ def analyze_ticker(
     volume = df["volume"].fillna(0)
 
     # ── Filtro ADV ────────────────────────────────────────────────────────────
+   # ── Filtro Dollar Volume ──────────────────────────────────────────────────
     adv_30 = compute_adv(volume, 30).iloc[-1]
     adv_90 = compute_adv(volume, 90).iloc[-1]
 
     if pd.isna(adv_30) or pd.isna(adv_90):
         return None
-    if adv_30 < MIN_ADV or adv_90 < MIN_ADV:
+        
+    last_close = close.iloc[-1]
+    dv_30 = adv_30 * last_close
+    dv_90 = adv_90 * last_close
+
+    if dv_30 < MIN_DOLLAR_VOLUME or dv_90 < MIN_DOLLAR_VOLUME:
         logger.debug(
-            f"{ticker}: ADV KO — 30d={adv_30:,.0f} 90d={adv_90:,.0f} "
-            f"(min={MIN_ADV:,.0f})"
+            f"{ticker}: Dollar Volume KO — 30d=${dv_30:,.0f} 90d=${dv_90:,.0f} "
+            f"(min=${MIN_DOLLAR_VOLUME:,.0f})"
         )
         return None
 
@@ -561,9 +567,15 @@ def run_analysis(
                 else:
                     try:
                         vol = df["volume"].fillna(0) if "volume" in df.columns else pd.Series([0])
+                        close_price = df["adjusted_close"].iloc[-1] if "adjusted_close" in df.columns else 0
+                        
                         adv30 = compute_adv(vol, 30).iloc[-1]
                         adv90 = compute_adv(vol, 90).iloc[-1]
-                        if pd.isna(adv30) or pd.isna(adv90) or adv30 < MIN_ADV or adv90 < MIN_ADV:
+                        
+                        dv30 = adv30 * close_price
+                        dv90 = adv90 * close_price
+                        
+                        if pd.isna(dv30) or pd.isna(dv90) or dv30 < MIN_DOLLAR_VOLUME or dv90 < MIN_DOLLAR_VOLUME:
                             fail_adv += 1
                         else:
                             fail_history += 1
