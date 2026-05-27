@@ -26,7 +26,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # ── Default parameters (allineati al documento di progettazione) ──────────────
-RV_WINDOW: int              = 90    # Finestra RV "lunga" — regime storico
+RV_WINDOW: int              = 45    # Finestra RV "lunga" — regime storico
 RV_SHORT_WINDOW: int        = 20    # Finestra RV "corta" — squeeze recente
 RV_INTERMEDIATE_WINDOW: int = 60    # Finestra RV "intermedia" — regime recente
 PERCENTILE_LOOKBACK: int    = 756   # Lookback percentile (~3 anni trading days)
