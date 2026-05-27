@@ -37,10 +37,18 @@ if str(_SRC_DIR) not in sys.path:
 
 from data_fetcher import EODHDClient, EODHDError
 from quant_engine import (
+    ATR_PERCENTILE_LOOKBACK,
+    ATR_WINDOW,
     COMPRESSION_THRESHOLD,
+    EXPANSION_TIER_HIGH,
+    EXPANSION_TIER_LOW,
+    EXPANSION_TIER_MEDIUM,
     MIN_ADV,
     PERCENTILE_LOOKBACK,
+    RV_INTERMEDIATE_WINDOW,
+    RV_SHORT_WINDOW,
     RV_WINDOW,
+    STRADDLE_GATE_PCT,
     run_analysis,
 )
 
@@ -240,7 +248,19 @@ def run_pipeline() -> None:
         logger.warning("Nessun ticker qualificato — salvo dataset vuoto con schema.")
         empty_cols = [
             "ticker", "rv_current", "rv_percentile", "rv_52w_min", "rv_52w_max",
-            "adv_30d", "adv_90d", "close_price", "last_date", "is_compressed",
+            # Nuove metriche multi-window
+            "rv_20", "rv_60", "rv_term_structure",
+            # ATR
+            "atr_pct", "atr_pct_percentile",
+            # Expansion
+            "expansion_ratio", "expansion_tier",
+            # Volume / prezzo / flags
+            "adv_30d", "adv_90d", "close_price", "last_date",
+            "is_compressed", "is_straddle_candidate",
+            # Ranking Borda
+            "rank_rv_pct", "rank_atr_pct", "rank_term_structure",
+            "borda_score", "borda_rank",
+            # Metadata ticker
             "market_cap", "name", "type",
             "next_earnings_date", "days_to_earnings",
         ]
@@ -248,23 +268,40 @@ def run_pipeline() -> None:
 
     n_qualified  = len(results_df)
     n_compressed = int(results_df["is_compressed"].sum()) if "is_compressed" in results_df.columns else 0
+    n_straddle   = (
+        int(results_df["is_straddle_candidate"].sum())
+        if "is_straddle_candidate" in results_df.columns else 0
+    )
 
     # ── Step 7: Metadati run e salvataggio ────────────────────────────────────
     metadata = {
-        "run_timestamp":          run_ts.isoformat(),
-        "tickers_scanned":        n_universe,
-        "tickers_with_data":      n_with_data,
-        "tickers_passed_filters": n_qualified,
-        "tickers_compressed":     n_compressed,
-        "rv_window":              RV_WINDOW,
-        "percentile_lookback":    PERCENTILE_LOOKBACK,
-        "compression_threshold":  COMPRESSION_THRESHOLD,
-        "min_market_cap":         MIN_MARKET_CAP,
-        "min_adv":                MIN_ADV,
-        "history_years":          HISTORY_YEARS,
-        "history_buffer_days":    HISTORY_BUFFER_DAYS,
-        "from_date":              from_date,
-        "to_date":                to_date,
+        "run_timestamp":            run_ts.isoformat(),
+        "tickers_scanned":          n_universe,
+        "tickers_with_data":        n_with_data,
+        "tickers_passed_filters":   n_qualified,
+        "tickers_compressed":       n_compressed,
+        "tickers_straddle_candidate": n_straddle,
+        # Parametri RV
+        "rv_window":                RV_WINDOW,
+        "rv_short_window":          RV_SHORT_WINDOW,
+        "rv_intermediate_window":   RV_INTERMEDIATE_WINDOW,
+        "percentile_lookback":      PERCENTILE_LOOKBACK,
+        # Parametri ATR
+        "atr_window":               ATR_WINDOW,
+        "atr_percentile_lookback":  ATR_PERCENTILE_LOOKBACK,
+        # Soglie
+        "compression_threshold":    COMPRESSION_THRESHOLD,
+        "straddle_gate_pct":        STRADDLE_GATE_PCT,
+        "expansion_tier_low":       EXPANSION_TIER_LOW,
+        "expansion_tier_medium":    EXPANSION_TIER_MEDIUM,
+        "expansion_tier_high":      EXPANSION_TIER_HIGH,
+        # Universo / volume
+        "min_market_cap":           MIN_MARKET_CAP,
+        "min_adv":                  MIN_ADV,
+        "history_years":            HISTORY_YEARS,
+        "history_buffer_days":      HISTORY_BUFFER_DAYS,
+        "from_date":                from_date,
+        "to_date":                  to_date,
     }
 
     _save_results(results_df, metadata)
@@ -274,7 +311,8 @@ def run_pipeline() -> None:
         f"  SUMMARY: {n_universe} scansionati | "
         f"{n_with_data} con dati | "
         f"{n_qualified} qualificati | "
-        f"{n_compressed} COMPRESSI (≤{COMPRESSION_THRESHOLD}° pct)"
+        f"{n_compressed} COMPRESSI (≤{COMPRESSION_THRESHOLD}° pct) | "
+        f"{n_straddle} STRADDLE CANDIDATES"
     )
     logger.info("=" * 65)
 
