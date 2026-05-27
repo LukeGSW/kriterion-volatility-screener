@@ -14,12 +14,13 @@ triennale, mantenendo i costi API ragionevoli.
 No options data. No hard stop logic.
 """
 
+import csv
+import io
 import logging
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -44,49 +45,22 @@ VALID_TYPES = {"Common Stock", "ETF"}
 MIN_VOLUME_PREFILTER = 100_000
 
 
-# ── Keyword filter per il titolo di articoli M&A ─────────────────────────────
-# Il tag MERGERS AND ACQUISITIONS di EODHD e' troppo generico (cattura anche
-# commenti di settore, dichiarazioni di CEO acquirer, advisory news, Form 8.5
-# UK Takeover Panel). Questo filtro identifica SOLO articoli che annunciano
-# o discutono un deal specifico, escludendo il rumore.
+# ── NYLI Merger Arbitrage ETF (MNA) ───────────────────────────────────────────
+# Fonte: New York Life Investment Management.
+# CSV pubblico con le holdings dell'ETF MNA, che e' LONG sui target di deal
+# M&A annunciati globalmente. Lo usiamo come blacklist deal-pending per
+# escludere questi titoli dai candidati Long Straddle.
 #
-# Pattern catturati (case-insensitive):
-#   - "X to be acquired by Y" / "X to acquire Y"
-#   - "X agrees to acquire Y" / "agrees? to be acquired"
-#   - "merger agreement" / "definitive (merger) agreement"
-#   - "tender offer for X"
-#   - "X to go private" / "go-private" / "take X private"
-#   - "X to merge with Y" / "merger of equals"
-#   - "buyout" / "takeover bid"
-#   - "completes acquisition" / "closes acquisition" (deal in chiusura)
-#   - "acquires"  (passato semplice, deal annunciato)
-DEAL_TITLE_PATTERN = re.compile(
-    r"\b("
-    r"to\s+be\s+acquired\s+by|"
-    r"agrees?\s+to\s+(be\s+)?acquire|"
-    r"agrees?\s+to\s+be\s+acquired|"
-    r"(definitive\s+)?merger\s+agreement|"
-    r"tender\s+offer\s+for|"
-    # "take [obj] private" con 0-4 parole intermedie (es: 'take EA private',
-    # 'take Pioneer Natural Resources private')
-    r"take(?:\s+\S+){0,4}\s+private|"
-    r"to\s+go\s+private|"
-    r"go[\s-]private|"
-    r"take[\s-]over\b|"
-    r"merger\s+of\s+equals|"
-    r"to\s+merge\s+with|"
-    # "buyout" solo se preceduto da indicatore monetario o "completes/in/all-cash"
-    r"\$[\d\.]+\s*[a-zA-Z]?\s+buyout|"
-    r"all[\s-]cash\s+buyout|"
-    r"completes?\s+\S+\s+buyout|"
-    r"takeover\s+(bid|offer)|"
-    r"completes?\s+(the\s+)?acquisition|"
-    r"closes?\s+(the\s+)?acquisition|"
-    r"to\s+acquire\b|"
-    r"acquires?\b"
-    r")\b",
-    re.IGNORECASE,
-)
+# Asset Group da includere (posizioni LONG sui target):
+#   - 'Equity Common'  → azioni di target di takeover
+#   - 'REIT'           → REIT target di acquisizioni
+# Asset Group da ESCLUDERE:
+#   - 'TOTAL RETURN SWAPS' → short hedge sugli acquirer in stock-deals
+#   - 'CASH', 'MONEY MARKET', 'CURRENCY SECURITY' → liquidita'
+#   - 'Exchange Traded Fund' → treasury parking
+#   - 'CVR' → Contingent Value Rights, residui di deal chiusi
+MNA_ETF_CSV_URL: str = "https://data.nylim.com/MMNA.csv"
+MNA_ETF_INCLUDED_ASSET_GROUPS: tuple = ("Equity Common", "REIT")
 
 
 # -- Custom exception ----------------------------------------------------------
@@ -533,248 +507,190 @@ class EODHDClient:
         logger.info("Earnings trovate: %d/%d ticker", found, len(tickers))
         return earnings_map
 
-    # -- News API: blacklist M&A (deal-pending exclusion) ---------------------
-    def get_ma_news_tickers(
-        self,
-        days_lookback: int   = 180,
-        min_mentions: int    = 1,
-        market_suffix: str   = ".US",
-        page_limit: int      = 1000,
-        max_pages: int       = 30,
-        require_deal_keyword: bool = True,
-    ) -> Dict[str, int]:
+    # -- MNA ETF holdings: blacklist deal-pending -----------------------------
+    @staticmethod
+    def _clean_excel_quoted(raw: str) -> str:
         """
-        Recupera la blacklist dei ticker oggetto di M&A negli ultimi N giorni
-        usando il News API EODHD con tag 'MERGERS AND ACQUISITIONS', filtrato
-        per keyword di "deal annunciato" nel titolo.
+        Pulisce un campo del formato Excel-quoted usato da NYLI: ='VALUE' o ="VALUE".
+        Rimuove anche eventuali spazi.
+        """
+        if raw is None:
+            return ""
+        s = raw.strip()
+        # Pattern Excel: ="VALUE"  oppure  ='VALUE'
+        if s.startswith('="') and s.endswith('"'):
+            s = s[2:-1]
+        elif s.startswith("='") and s.endswith("'"):
+            s = s[2:-1]
+        elif s.startswith('"') and s.endswith('"'):
+            s = s[1:-1]
+        return s.strip()
 
-        Logica:
-          1. Paginazione di /api/news?t=MERGERS+AND+ACQUISITIONS&from=...&to=...
-          2. FILTRO TITOLO: scarta articoli il cui titolo NON contiene keyword
-             di deal annunciato (DEAL_TITLE_PATTERN). Questo elimina:
-               - Form 8.5 UK disclosures
-               - Commenti di settore generici
-               - Articoli su mega-cap che fanno multiple M&A
-               - Speculazioni e rumor non confermati
-          3. Aggregazione del campo `symbols` degli articoli sopravvissuti
-          4. Filtro per market_suffix (default '.US' per coerenza con universo)
-          5. Conteggio occorrenze: ogni ticker e' contato 1 volta per articolo
-          6. Restituisce solo ticker con conteggio >= min_mentions
+    @staticmethod
+    def _normalize_mna_ticker(raw_ticker: str) -> str:
+        """
+        Normalizza un ticker dell'ETF MNA per matching con universo .US.
+        Esempi:
+          'TECK/B'  → 'TECK'   (rimuove classe azionaria)
+          'AAL SMS' → ''       (swap, scartato — gestito dal filtro Asset Group)
+          'EA'      → 'EA'
+          '700'     → '700'    (ticker numerico Tencent HK)
+        """
+        t = (raw_ticker or "").strip().upper()
+        if not t:
+            return ""
+        # Scarta ticker con spazi (di solito sono SMS swap o currency)
+        if " " in t:
+            return ""
+        # Rimuove classe azionaria (TECK/B → TECK, BRK.B → BRK)
+        for sep in ("/", ".", "-"):
+            if sep in t:
+                t = t.split(sep)[0]
+        return t
+
+    def get_mna_etf_holdings(
+        self,
+        url: str = MNA_ETF_CSV_URL,
+        included_asset_groups: tuple = MNA_ETF_INCLUDED_ASSET_GROUPS,
+        timeout: int = REQUEST_TIMEOUT,
+    ) -> Tuple[Dict[str, float], Optional[str]]:
+        """
+        Scarica le holdings del NYLI Merger Arbitrage ETF (MNA) e ne estrae
+        i ticker target di deal-pending con il loro peso percentuale.
+
+        L'ETF e' gestito da NYLI e mantiene posizioni LONG sui target di
+        takeover annunciati globalmente. Per la nostra blacklist Long Straddle:
+          - INCLUDIAMO le posizioni 'Equity Common' e 'REIT' (target reali)
+          - ESCLUDIAMO 'TOTAL RETURN SWAPS' (short hedge sugli acquirer),
+            'CASH', 'MONEY MARKET', 'CURRENCY SECURITY', 'CVR', ecc.
 
         Parameters
         ----------
-        days_lookback : int
-            Finestra temporale (giorni indietro da oggi) per cercare news M&A.
-        min_mentions : int
-            Soglia minima di articoli distinti per includere un ticker.
-            Con require_deal_keyword=True bastano min_mentions=1 perche'
-            ogni articolo che passa il keyword filter e' gia' un segnale forte.
-        market_suffix : str
-            Suffisso EODHD per filtrare il market (es. '.US', '.LSE').
-            Stringa vuota disabilita il filtro.
-        page_limit : int
-            Articoli per pagina (max 1000 da spec EODHD).
-        max_pages : int
-            Safety cap sulla paginazione.
-        require_deal_keyword : bool
-            Se True (default), applica DEAL_TITLE_PATTERN per filtrare i
-            titoli. Se False, conta TUTTI gli articoli del tag (comportamento
-            legacy, alto rumore).
+        url : str
+            URL del CSV pubblico delle holdings (default: MNA_ETF_CSV_URL).
+        included_asset_groups : tuple
+            Asset Group da includere nella blacklist.
+        timeout : int
+            Timeout HTTP in secondi.
 
         Returns
         -------
-        dict {ticker_base: n_mentions} per ticker con n >= min_mentions.
+        Tuple di:
+            - dict {ticker_normalizzato: pct_net_assets}
+            - str | None: data delle holdings (es. '2026-03-27'), o None se
+                          non trovata nel CSV header.
 
         Raises
         ------
-        EODHDError se la chiamata API fallisce (no fallback).
+        EODHDError se il download fallisce (no fallback, come richiesto).
         """
-        today    = datetime.utcnow().date()
-        from_dt  = today - timedelta(days=days_lookback)
+        logger.info("MNA ETF: download holdings da %s", url)
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            raise EODHDError("MNA ETF CSV fetch failed: {}".format(e)) from e
 
-        url = "{}/news".format(BASE_URL)
-        ticker_counts: Dict[str, int] = {}
-        # Conteggio dei symbol "scartati" dal filtro market per diagnostica
-        rejected_suffix_samples: Dict[str, int] = {}
-        sample_articles_logged = 0
-        sample_matched_logged  = 0  # log dei primi titoli che matchano
-        total_articles         = 0
-        articles_kept          = 0  # articoli che passano il keyword filter
-        articles_no_keyword    = 0  # articoli scartati dal keyword filter
-        articles_no_symbols    = 0  # articoli passati ma con symbols=[]
-        offset         = 0
-        page_idx       = 0
+        text = resp.text
+        holdings_date: Optional[str] = None
+        # Parsing CSV
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+
+        # Estrai data holdings dall'header (seconda riga tipicamente)
+        for r in rows[:5]:
+            if len(r) >= 2 and r[0].strip().rstrip(":").lower() == "holdings":
+                holdings_date = r[1].strip()
+                break
+
+        # Trova la riga di intestazione delle colonne
+        header_idx: Optional[int] = None
+        for i, r in enumerate(rows):
+            # Header riconosciuto se la prima colonna e' 'Ticker'
+            if r and r[0].strip().strip('"').strip('=').strip('"') == "Ticker":
+                header_idx = i
+                break
+
+        if header_idx is None:
+            raise EODHDError("MNA ETF CSV: header 'Ticker' non trovato")
+
+        headers = [h.strip() for h in rows[header_idx]]
+        try:
+            col_ticker = headers.index("Ticker")
+            col_desc   = headers.index("Security Description")
+            col_group  = headers.index("Asset Group")
+            col_pct    = headers.index("% of Net Assets")
+        except ValueError as e:
+            raise EODHDError(
+                "MNA ETF CSV: colonne attese non trovate ({})".format(e)
+            ) from e
+
+        holdings: Dict[str, float] = {}
+        n_total       = 0
+        n_kept        = 0
+        n_skip_group  = 0
+        n_skip_ticker = 0
+        included_set  = set(g.lower() for g in included_asset_groups)
+
+        for r in rows[header_idx + 1:]:
+            if len(r) <= max(col_ticker, col_group, col_pct):
+                continue
+            n_total += 1
+
+            asset_group = r[col_group].strip()
+            if asset_group.lower() not in included_set:
+                n_skip_group += 1
+                continue
+
+            raw_ticker = self._clean_excel_quoted(r[col_ticker])
+            ticker     = self._normalize_mna_ticker(raw_ticker)
+            if not ticker:
+                n_skip_ticker += 1
+                continue
+
+            try:
+                pct_str = r[col_pct].strip()
+                # Some rows may have already a numeric value, others a string
+                pct = float(pct_str) if pct_str else 0.0
+            except (ValueError, TypeError):
+                pct = 0.0
+
+            # Se duplicato (raro), prendi il peso maggiore
+            if ticker in holdings:
+                holdings[ticker] = max(holdings[ticker], pct)
+            else:
+                holdings[ticker] = pct
+            n_kept += 1
 
         logger.info(
-            "News M&A: fetch %s -> %s (lookback %dgg, min_mentions=%d, "
-            "market='%s', keyword_filter=%s)",
-            from_dt.isoformat(), today.isoformat(),
-            days_lookback, min_mentions, market_suffix,
-            "ON" if require_deal_keyword else "OFF",
+            "MNA ETF: holdings_date=%s | righe totali=%d | "
+            "kept=%d | skip_asset_group=%d | skip_ticker_vuoto=%d | "
+            "ticker unici=%d",
+            holdings_date, n_total, n_kept, n_skip_group,
+            n_skip_ticker, len(holdings),
         )
 
-        while page_idx < max_pages:
-            params = {
-                "api_token": self.api_token,
-                "fmt":       "json",
-                "t":         "MERGERS AND ACQUISITIONS",
-                "from":      from_dt.isoformat(),
-                "to":        today.isoformat(),
-                "limit":     page_limit,
-                "offset":    offset,
-            }
-            data = _get_json(url, params)  # raise EODHDError on failure
-
-            if not isinstance(data, list):
-                logger.warning(
-                    "News API: response non-list a pagina %d (offset %d). "
-                    "Tipo: %s. Interrompo paginazione.",
-                    page_idx + 1, offset, type(data).__name__,
-                )
-                break
-
-            n_returned = len(data)
-            if n_returned == 0:
-                logger.info("News M&A: nessun articolo a offset %d, fine paginazione.", offset)
-                break
-
-            total_articles += n_returned
-
-            # Aggrega ticker per articolo. Set per articolo per evitare
-            # doppi conteggi quando un ticker appare piu' volte nello stesso articolo.
-            for article in data:
-                if not isinstance(article, dict):
-                    continue
-
-                title = article.get("title", "") or ""
-
-                # ── KEYWORD FILTER sul titolo ──────────────────────────────────
-                # Se attivo, scarta articoli che non matchano DEAL_TITLE_PATTERN.
-                if require_deal_keyword:
-                    if not DEAL_TITLE_PATTERN.search(title):
-                        articles_no_keyword += 1
-                        # Log primi 2 esempi di articoli scartati per debug
-                        if sample_articles_logged < 2:
-                            logger.info(
-                                "News M&A scartato (no keyword): '%s'",
-                                title[:100],
-                            )
-                            sample_articles_logged += 1
-                        continue
-
-                articles_kept += 1
-
-                # Log dei primi 3 articoli che PASSANO il keyword filter
-                if sample_matched_logged < 3:
-                    symbols_preview = article.get("symbols") or []
-                    logger.info(
-                        "News M&A MATCHED %d: title='%s' | symbols=%s",
-                        sample_matched_logged + 1,
-                        title[:100],
-                        symbols_preview[:10],
-                    )
-                    sample_matched_logged += 1
-
-                symbols = article.get("symbols") or []
-                if not isinstance(symbols, list) or len(symbols) == 0:
-                    articles_no_symbols += 1
-                    continue
-
-                # Set per articolo: ogni ticker conta 1 volta per articolo
-                article_tickers = set()
-                for sym in symbols:
-                    if not isinstance(sym, str):
-                        continue
-                    sym = sym.strip()
-                    # Filtro market suffix
-                    if market_suffix and not sym.endswith(market_suffix):
-                        # Diagnostica: conteggio dei suffissi scartati
-                        # (per capire se EODHD usa formati alternativi)
-                        if "." in sym:
-                            suf = sym[sym.rindex("."):]
-                            rejected_suffix_samples[suf] = (
-                                rejected_suffix_samples.get(suf, 0) + 1
-                            )
-                        else:
-                            rejected_suffix_samples["NO_SUFFIX"] = (
-                                rejected_suffix_samples.get("NO_SUFFIX", 0) + 1
-                            )
-                        continue
-                    # Estrai ticker base (senza suffisso)
-                    base = sym[:-len(market_suffix)] if market_suffix else sym
-                    base = base.upper()
-                    if base:
-                        article_tickers.add(base)
-                for t in article_tickers:
-                    ticker_counts[t] = ticker_counts.get(t, 0) + 1
-
+        if holdings:
+            top10 = sorted(holdings.items(), key=lambda kv: -kv[1])[:10]
             logger.info(
-                "News M&A: pagina %d (offset %d): %d articoli ricevuti, "
-                "totale articoli=%d, ticker unici fino ad ora=%d",
-                page_idx + 1, offset, n_returned, total_articles, len(ticker_counts),
+                "MNA ETF top 10 holdings (ticker=peso%%): %s",
+                ", ".join("{}={:.2f}%".format(t, p) for t, p in top10),
             )
 
-            # Se la pagina e' incompleta, abbiamo finito
-            if n_returned < page_limit:
-                break
+        return holdings, holdings_date
 
-            offset   += page_limit
-            page_idx += 1
-            time.sleep(0.2)  # cortesia verso l'API
-
-        if page_idx >= max_pages:
-            logger.warning(
-                "News M&A: max_pages=%d raggiunto. "
-                "Articoli scansionati=%d (potrebbero esserci ulteriori articoli non visti).",
-                max_pages, total_articles,
-            )
-
-        # Filtro per soglia minima
-        blacklist = {t: n for t, n in ticker_counts.items() if n >= min_mentions}
-
-        logger.info(
-            "News M&A: fetch completato. "
-            "Articoli totali=%d (kept=%d, no_keyword=%d, no_symbols=%d), "
-            "ticker unici menzionati=%d, blacklist finale (n>=%d)=%d ticker",
-            total_articles, articles_kept, articles_no_keyword,
-            articles_no_symbols, len(ticker_counts),
-            min_mentions, len(blacklist),
+    # -- Legacy news endpoint (RIMOSSO) ---------------------------------------
+    # La funzione get_ma_news_tickers basata sul News API EODHD (tag MERGERS
+    # AND ACQUISITIONS) e' stata rimossa perche' produceva falsi positivi
+    # massicci (mega-cap acquirer come NVDA, GS, MS, APO, KKR, BAM, BX
+    # finivano in blacklist) e falsi negativi sui target veri (WBD, WBS, EA
+    # non venivano sempre catturati). Il dato EODHD non distingue tra
+    # acquirer e target nel campo `symbols`, ed e' un limite irrisolvibile.
+    # Sostituita con get_mna_etf_holdings() sopra.
+    def _DELETED_get_ma_news_tickers(self, *args, **kwargs):
+        """Deprecato. Sostituito da get_mna_etf_holdings()."""
+        raise NotImplementedError(
+            "get_ma_news_tickers e' stato rimosso. "
+            "Usa get_mna_etf_holdings() che legge il NYLI Merger Arbitrage ETF "
+            "(MNA) CSV — fonte molto piu' affidabile per la blacklist deal-pending."
         )
-
-        if blacklist:
-            # Log dei top 20 per maggior conteggio (i piu' "caldi")
-            top = sorted(blacklist.items(), key=lambda kv: -kv[1])[:20]
-            logger.info(
-                "Top blacklist (ticker, n_mentions): %s",
-                ", ".join("{}={}".format(t, n) for t, n in top),
-            )
-
-        # ── Diagnostica per debug della copertura ────────────────────────────
-        # 1. Conteggio dei suffissi scartati (per capire se EODHD usa formati
-        #    diversi da .US per alcuni ticker quotati su US exchanges)
-        if rejected_suffix_samples:
-            top_rej = sorted(
-                rejected_suffix_samples.items(), key=lambda kv: -kv[1]
-            )[:15]
-            logger.info(
-                "News M&A — suffissi scartati dal filtro '%s' (top 15): %s",
-                market_suffix,
-                ", ".join("{}={}".format(s, n) for s, n in top_rej),
-            )
-
-        # 2. Ticker sotto soglia: utile per capire se min_mentions e' troppo
-        #    restrittivo. Mostra i top 30 sotto soglia (con conteggio < min_mentions).
-        below_threshold = {
-            t: n for t, n in ticker_counts.items() if n < min_mentions
-        }
-        if below_threshold:
-            top_below = sorted(
-                below_threshold.items(), key=lambda kv: -kv[1]
-            )[:30]
-            logger.info(
-                "News M&A — ticker sotto soglia (n<%d), top 30: %s",
-                min_mentions,
-                ", ".join("{}={}".format(t, n) for t, n in top_below),
-            )
-
-        return blacklist
