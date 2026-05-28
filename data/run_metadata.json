@@ -1,9 +1,9 @@
 {
-  "run_timestamp": "2026-05-27T23:08:40.183995",
-  "tickers_scanned": 158,
-  "tickers_with_data": 158,
-  "tickers_passed_filters": 155,
-  "tickers_compressed": 4,
+  "run_timestamp": "2026-05-28T23:06:29.441542",
+  "tickers_scanned": 159,
+  "tickers_with_data": 159,
+  "tickers_passed_filters": 156,
+  "tickers_compressed": 5,
   "tickers_straddle_candidate": 8,
   "tickers_deal_pending": 0,
   "rv_window": 14,
@@ -18,12 +18,12 @@
   "expansion_tier_medium": 2.0,
   "expansion_tier_high": 3.0,
   "mna_etf_source": "NYLI Merger Arbitrage ETF (MNA)",
-  "mna_etf_holdings_date": "2026-05-26",
-  "mna_etf_blacklist_size": 40,
+  "mna_etf_holdings_date": "2026-05-27",
+  "mna_etf_blacklist_size": 39,
   "min_market_cap": 100000000000,
   "min_dollar_volume": 50000000,
   "history_years": 3,
   "history_buffer_days": 365,
-  "from_date": "2022-05-28",
-  "to_date": "2026-05-27"
+  "from_date": "2022-05-29",
+  "to_date": "2026-05-28"
 }
